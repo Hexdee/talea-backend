@@ -1,0 +1,319 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  READER
+  AUTHOR
+}
+
+enum AuthAccountProvider {
+  LOCAL
+  GOOGLE
+}
+
+enum BookStatus {
+  DRAFT
+  PUBLISHED
+  COMPLETED
+}
+
+enum SourceFormat {
+  RICH_TEXT_HTML
+  MARKDOWN
+  PLAIN
+}
+
+enum OfferType {
+  SINGLE_CHAPTER
+  CHAPTER_BUNDLE
+  FULL_BOOK
+}
+
+enum OrderStatus {
+  PENDING
+  COMPLETED
+  CANCELLED
+}
+
+enum PaymentStatus {
+  PENDING
+  SUCCEEDED
+  FAILED
+  CANCELLED
+}
+
+enum WalletTransactionType {
+  SALE
+  PAYOUT_REQUEST
+  PAYOUT_COMPLETED
+  ADJUSTMENT
+}
+
+enum PayoutRequestStatus {
+  REQUESTED
+  REVIEWING
+  APPROVED
+  PAID
+  REJECTED
+}
+
+model User {
+  id              String             @id @default(cuid())
+  email           String             @unique
+  displayName     String
+  roles           Role[]             @default([READER])
+  createdAt       DateTime           @default(now())
+  updatedAt       DateTime           @updatedAt
+  books           Book[]             @relation("AuthorBooks")
+  authAccounts    AuthAccount[]
+  sessions        Session[]
+  orders          Order[]
+  entitlements    Entitlement[]
+  libraryItems    LibraryItem[]
+  readingProgress ReadingProgress[]
+  wallet          Wallet?
+  payoutAccounts  PayoutAccount[]
+  payoutRequests  PayoutRequest[]
+}
+
+model AuthAccount {
+  id                String              @id @default(cuid())
+  userId            String
+  user              User                @relation(fields: [userId], references: [id], onDelete: Cascade)
+  provider          AuthAccountProvider
+  providerAccountId String
+  passwordHash      String?
+  createdAt         DateTime            @default(now())
+  updatedAt         DateTime            @updatedAt
+
+  @@unique([provider, providerAccountId])
+}
+
+model Session {
+  id         String   @id @default(cuid())
+  userId     String
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash  String   @unique
+  userAgent  String?
+  ipAddress  String?
+  expiresAt  DateTime
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+}
+
+model Book {
+  id               String              @id @default(cuid())
+  slug             String              @unique
+  title            String
+  genre            String              @default("General Fiction")
+  tags             String[]            @default([])
+  synopsis         String
+  coverImageUrl    String?
+  status           BookStatus          @default(DRAFT)
+  authorId         String
+  author           User                @relation("AuthorBooks", fields: [authorId], references: [id], onDelete: Cascade)
+  chapters         Chapter[]
+  offers           Offer[]
+  entitlements     Entitlement[]
+  libraryItems     LibraryItem[]
+  readingProgress  ReadingProgress[]
+  analyticsMetrics AnalyticsSnapshot[]
+  createdAt        DateTime            @default(now())
+  updatedAt        DateTime            @updatedAt
+}
+
+model Chapter {
+  id                  String       @id @default(cuid())
+  bookId              String
+  book                Book         @relation(fields: [bookId], references: [id], onDelete: Cascade)
+  title               String
+  slug                String
+  chapterNumber       Int
+  isFree              Boolean      @default(false)
+  draftFormat         SourceFormat @default(RICH_TEXT_HTML)
+  draftContent        String
+  authorNotes         String?
+  checklistItems      Json?
+  publishedFormat     SourceFormat?
+  publishedContent    String?
+  publishedRenderedHtml String?
+  publishedAt         DateTime?
+  createdAt           DateTime     @default(now())
+  updatedAt           DateTime     @updatedAt
+
+  @@unique([bookId, chapterNumber])
+}
+
+model Offer {
+  id           String        @id @default(cuid())
+  bookId       String
+  book         Book          @relation(fields: [bookId], references: [id], onDelete: Cascade)
+  type         OfferType
+  title        String
+  description  String
+  priceInKobo  Int
+  currency     String        @default("NGN")
+  chapterStart Int?
+  chapterEnd   Int?
+  isActive     Boolean       @default(true)
+  orderItems   OrderItem[]
+  entitlements Entitlement[]
+  createdAt    DateTime      @default(now())
+  updatedAt    DateTime      @updatedAt
+}
+
+model Order {
+  id                String      @id @default(cuid())
+  userId            String
+  user              User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  status            OrderStatus @default(PENDING)
+  totalAmountInKobo Int
+  currency          String      @default("NGN")
+  customerEmail     String
+  payment           Payment?
+  items             OrderItem[]
+  createdAt         DateTime    @default(now())
+  updatedAt         DateTime    @updatedAt
+}
+
+model OrderItem {
+  id           String   @id @default(cuid())
+  orderId      String
+  order        Order    @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  offerId      String
+  offer        Offer    @relation(fields: [offerId], references: [id], onDelete: Restrict)
+  amountInKobo Int
+  createdAt    DateTime @default(now())
+
+  @@unique([orderId, offerId])
+}
+
+model Payment {
+  id              String        @id @default(cuid())
+  reference       String        @unique
+  orderId         String        @unique
+  order           Order         @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  amountInKobo    Int
+  currency        String        @default("NGN")
+  status          PaymentStatus @default(PENDING)
+  provider        String        @default("demo")
+  providerPayload Json?
+  paidAt          DateTime?
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+}
+
+model Entitlement {
+  id           String   @id @default(cuid())
+  userId       String
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  bookId       String
+  book         Book     @relation(fields: [bookId], references: [id], onDelete: Cascade)
+  offerId      String
+  offer        Offer    @relation(fields: [offerId], references: [id], onDelete: Restrict)
+  chapterStart Int?
+  chapterEnd   Int?
+  fullBook     Boolean  @default(false)
+  grantedAt    DateTime @default(now())
+
+  @@index([userId, bookId])
+  @@unique([userId, bookId, offerId])
+}
+
+model LibraryItem {
+  id                String   @id @default(cuid())
+  userId            String
+  user              User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  bookId            String
+  book              Book     @relation(fields: [bookId], references: [id], onDelete: Cascade)
+  lastOpenedChapter Int?
+  lastOpenedAt      DateTime?
+  addedAt           DateTime @default(now())
+
+  @@unique([userId, bookId])
+}
+
+model ReadingProgress {
+  id                 String   @id @default(cuid())
+  userId             String
+  user               User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  bookId             String
+  book               Book     @relation(fields: [bookId], references: [id], onDelete: Cascade)
+  currentChapterNumber Int
+  currentPage        Int      @default(1)
+  progressPercent    Int      @default(0)
+  lastReadAt         DateTime @updatedAt
+
+  @@unique([userId, bookId])
+}
+
+model Wallet {
+  id                     String              @id @default(cuid())
+  userId                 String              @unique
+  user                   User                @relation(fields: [userId], references: [id], onDelete: Cascade)
+  availableBalanceInKobo Int                 @default(0)
+  pendingBalanceInKobo   Int                 @default(0)
+  transactions           WalletTransaction[]
+  createdAt              DateTime            @default(now())
+  updatedAt              DateTime            @updatedAt
+}
+
+model WalletTransaction {
+  id           String                @id @default(cuid())
+  walletId     String
+  wallet       Wallet                @relation(fields: [walletId], references: [id], onDelete: Cascade)
+  type         WalletTransactionType
+  amountInKobo Int
+  reference    String
+  description  String
+  createdAt    DateTime              @default(now())
+
+  @@index([walletId, createdAt])
+}
+
+model PayoutAccount {
+  id                  String          @id @default(cuid())
+  userId              String
+  user                User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  bankName            String
+  accountName         String
+  accountNumberMasked String
+  provider            String
+  isDefault           Boolean         @default(false)
+  payoutRequests      PayoutRequest[]
+  createdAt           DateTime        @default(now())
+  updatedAt           DateTime        @updatedAt
+}
+
+model PayoutRequest {
+  id              String              @id @default(cuid())
+  userId          String
+  user            User                @relation(fields: [userId], references: [id], onDelete: Cascade)
+  payoutAccountId String?
+  payoutAccount   PayoutAccount?      @relation(fields: [payoutAccountId], references: [id], onDelete: SetNull)
+  amountInKobo    Int
+  status          PayoutRequestStatus @default(REQUESTED)
+  notes           String?
+  requestedAt     DateTime            @default(now())
+  processedAt     DateTime?
+}
+
+model AnalyticsSnapshot {
+  id               String   @id @default(cuid())
+  bookId           String
+  book             Book     @relation(fields: [bookId], references: [id], onDelete: Cascade)
+  date             DateTime
+  views            Int      @default(0)
+  purchases        Int      @default(0)
+  revenueInKobo    Int      @default(0)
+  completionRate   Int      @default(0)
+  activeReaders    Int      @default(0)
+
+  @@unique([bookId, date])
+}
