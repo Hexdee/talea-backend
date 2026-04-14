@@ -17,9 +17,9 @@ export class AnalyticsService {
       },
     });
 
-    const revenueInKobo = books
+    const revenueInUsdcMinor = books
       .flatMap((book) => book.analyticsMetrics)
-      .reduce((sum, item) => sum + item.revenueInKobo, 0);
+      .reduce((sum, item) => sum + item.revenueInUsdcMinor, 0);
     const purchases = books
       .flatMap((book) => book.analyticsMetrics)
       .reduce((sum, item) => sum + item.purchases, 0);
@@ -29,7 +29,7 @@ export class AnalyticsService {
       publishedChapterCount: books
         .flatMap((book) => book.chapters)
         .filter((chapter) => chapter.publishedAt).length,
-      revenueInKobo,
+      revenueInUsdcMinor,
       purchases,
       books: books.map((book) => ({
         id: book.id,
@@ -39,8 +39,8 @@ export class AnalyticsService {
           (sum, item) => sum + item.purchases,
           0,
         ),
-        revenueInKobo: book.analyticsMetrics.reduce(
-          (sum, item) => sum + item.revenueInKobo,
+        revenueInUsdcMinor: book.analyticsMetrics.reduce(
+          (sum, item) => sum + item.revenueInUsdcMinor,
           0,
         ),
       })),

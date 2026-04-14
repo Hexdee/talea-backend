@@ -1,4 +1,4 @@
-app = "talea-backend"
+app = "lesenpad-backend"
 primary_region = "jnb"
 
 [build]

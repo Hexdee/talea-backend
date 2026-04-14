@@ -12,6 +12,7 @@ import type {
   AuthenticatedRequest,
   SessionUser,
 } from '../common/types/authenticated-request';
+import { SolanaService } from '../chain/solana.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { LoginDto } from './dto/login.dto';
 import { SignupDto } from './dto/signup.dto';
@@ -33,12 +34,13 @@ export class AuthService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly configService: ConfigService,
+    private readonly solanaService: SolanaService,
   ) {}
 
   private getCookieName() {
     return this.configService.get<string>(
       'SESSION_COOKIE_NAME',
-      'talea_session',
+      'lesenpad_session',
     );
   }
 
@@ -118,13 +120,14 @@ export class AuthService {
     }
 
     const passwordHash = await bcrypt.hash(dto.password, 10);
-    const roles = dto.becomeAuthor ? [Role.READER, Role.AUTHOR] : [Role.READER];
+
+    const custodialWallet = this.solanaService.createCustodialWallet();
 
     const user = await this.prisma.user.create({
       data: {
         email: dto.email,
         displayName: dto.displayName,
-        roles,
+        roles: [Role.USER],
         authAccounts: {
           create: {
             provider: AuthAccountProvider.LOCAL,
@@ -134,6 +137,16 @@ export class AuthService {
         },
         wallet: {
           create: {},
+        },
+        chainWallets: {
+          create: {
+            address: custodialWallet.address,
+            label: 'Lesenpad custodial wallet',
+            custodyType: 'CUSTODIAL',
+            encryptedPrivateKey: custodialWallet.encryptedPrivateKey,
+            isDefault: true,
+            isCreatorPayoutWallet: true,
+          },
         },
       },
     });
@@ -192,6 +205,8 @@ export class AuthService {
     },
     response: Response,
   ) {
+    const custodialWallet = this.solanaService.createCustodialWallet();
+
     const user = await this.prisma.user.upsert({
       where: {
         email: payload.email,
@@ -217,7 +232,7 @@ export class AuthService {
       create: {
         email: payload.email,
         displayName: payload.displayName,
-        roles: [Role.READER],
+        roles: [Role.USER],
         authAccounts: {
           create: {
             provider: AuthAccountProvider.GOOGLE,
@@ -226,6 +241,16 @@ export class AuthService {
         },
         wallet: {
           create: {},
+        },
+        chainWallets: {
+          create: {
+            address: custodialWallet.address,
+            label: 'Lesenpad custodial wallet',
+            custodyType: 'CUSTODIAL',
+            encryptedPrivateKey: custodialWallet.encryptedPrivateKey,
+            isDefault: true,
+            isCreatorPayoutWallet: true,
+          },
         },
       },
     });

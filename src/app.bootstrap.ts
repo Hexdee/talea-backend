@@ -14,7 +14,7 @@ export function configureApp(
   const uploadsPath = join(process.cwd(), 'uploads');
   const frontendOrigin = process.env.FRONTEND_ORIGIN?.split(',').map((origin) =>
     origin.trim(),
-  ) ?? ['http://localhost:3000'];
+  ) ?? ['http://localhost:3000', 'http://localhost:3001'];
 
   mkdirSync(uploadsPath, { recursive: true });
   app.enableCors({
@@ -44,12 +44,12 @@ export function configureApp(
 
   if (options?.enableDocs ?? true) {
     const swaggerConfig = new DocumentBuilder()
-      .setTitle('Talea API')
+      .setTitle('Lesenpad API')
       .setDescription(
-        'Backend API for the Talea serialized publishing platform.',
+        'Backend API for the Lesenpad serialized publishing platform.',
       )
       .setVersion('1.0.0')
-      .addCookieAuth('talea_session')
+      .addCookieAuth('lesenpad_session')
       .build();
 
     SwaggerModule.setup(

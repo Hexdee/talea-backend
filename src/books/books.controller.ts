@@ -7,7 +7,6 @@ import {
   Param,
   Patch,
   Post,
-  Req,
   UploadedFile,
   UseGuards,
   UseInterceptors,
@@ -15,56 +14,25 @@ import {
 } from '@nestjs/common';
 import { ApiTags } from '@nestjs/swagger';
 import { FileInterceptor } from '@nestjs/platform-express';
-import { diskStorage } from 'multer';
-import { extname, join } from 'node:path';
-import { mkdirSync } from 'node:fs';
-import type { Request } from 'express';
+import { memoryStorage } from 'multer';
+import { extname } from 'node:path';
 import { CurrentUser } from '../auth/decorators/current-user.decorator';
 import { OptionalSessionAuthGuard } from '../auth/guards/optional-session-auth.guard';
 import { SessionAuthGuard } from '../auth/guards/session-auth.guard';
 import type { SessionUser } from '../common/types/authenticated-request';
+import { MediaStorageService } from '../chain/media-storage.service';
 import { BooksService } from './books.service';
 import { UpsertBookDto, UpsertOfferDto } from './dto/book.dto';
 
-const uploadRoot = join(process.cwd(), 'uploads');
+function buildUploadFilename(originalName: string) {
+  const safeName = originalName
+    .replace(/\.[^.]+$/, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/(^-|-$)/g, '')
+    .slice(0, 48);
 
-function ensureUploadDirectory(directory: string) {
-  mkdirSync(directory, { recursive: true });
-  return directory;
-}
-
-function buildUploadStorage(folder: string) {
-  return diskStorage({
-    destination: (_request, _file, callback) => {
-      callback(null, ensureUploadDirectory(join(uploadRoot, folder)));
-    },
-    filename: (_request, file, callback) => {
-      const safeName = file.originalname
-        .replace(/\.[^.]+$/, '')
-        .toLowerCase()
-        .replace(/[^a-z0-9]+/g, '-')
-        .replace(/(^-|-$)/g, '')
-        .slice(0, 48);
-
-      callback(
-        null,
-        `${Date.now()}-${safeName || 'asset'}${extname(file.originalname).toLowerCase()}`,
-      );
-    },
-  });
-}
-
-function buildAbsoluteUploadUrl(request: Request, relativePath: string) {
-  const publicBaseUrl = process.env.BACKEND_PUBLIC_URL?.trim();
-
-  if (publicBaseUrl) {
-    return `${publicBaseUrl.replace(/\/$/, '')}${relativePath}`;
-  }
-
-  const forwardedProto = request.header('x-forwarded-proto');
-  const protocol = forwardedProto?.split(',')[0] ?? request.protocol;
-
-  return `${protocol}://${request.get('host')}${relativePath}`;
+  return `${Date.now()}-${safeName || 'asset'}${extname(originalName).toLowerCase()}`;
 }
 
 function ensureImageFile(file?: Express.Multer.File): Express.Multer.File {
@@ -101,7 +69,10 @@ function ensureEditorMediaFile(
 @ApiTags('books')
 @Controller('books')
 export class BooksController {
-  constructor(private readonly booksService: BooksService) {}
+  constructor(
+    private readonly booksService: BooksService,
+    private readonly mediaStorageService: MediaStorageService,
+  ) {}
 
   @Get('featured')
   @Version('1')
@@ -147,24 +118,21 @@ export class BooksController {
   @UseGuards(SessionAuthGuard)
   @UseInterceptors(
     FileInterceptor('file', {
-      storage: buildUploadStorage('covers'),
+      storage: memoryStorage(),
       limits: {
         fileSize: 8 * 1024 * 1024,
       },
     }),
   )
-  uploadCover(
-    @UploadedFile() file: Express.Multer.File | undefined,
-    @Req() request: Request,
-  ) {
+  uploadCover(@UploadedFile() file: Express.Multer.File | undefined) {
     const validFile = ensureImageFile(file);
-    const relativePath = `/uploads/covers/${validFile.filename}`;
 
-    return {
-      url: buildAbsoluteUploadUrl(request, relativePath),
-      path: relativePath,
+    return this.mediaStorageService.uploadPublicAsset({
+      folder: 'covers',
+      filename: buildUploadFilename(validFile.originalname),
+      buffer: validFile.buffer,
       mimeType: validFile.mimetype,
-    };
+    });
   }
 
   @Post('uploads/editor-media')
@@ -173,24 +141,21 @@ export class BooksController {
   @UseGuards(SessionAuthGuard)
   @UseInterceptors(
     FileInterceptor('file', {
-      storage: buildUploadStorage('editor-media'),
+      storage: memoryStorage(),
       limits: {
         fileSize: 25 * 1024 * 1024,
       },
     }),
   )
-  uploadEditorMedia(
-    @UploadedFile() file: Express.Multer.File | undefined,
-    @Req() request: Request,
-  ) {
+  uploadEditorMedia(@UploadedFile() file: Express.Multer.File | undefined) {
     const validFile = ensureEditorMediaFile(file);
-    const relativePath = `/uploads/editor-media/${validFile.filename}`;
 
-    return {
-      url: buildAbsoluteUploadUrl(request, relativePath),
-      path: relativePath,
+    return this.mediaStorageService.uploadPublicAsset({
+      folder: 'editor-media',
+      filename: buildUploadFilename(validFile.originalname),
+      buffer: validFile.buffer,
       mimeType: validFile.mimetype,
-    };
+    });
   }
 
   @Patch(':bookId')

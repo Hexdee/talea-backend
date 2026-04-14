@@ -1,5 +1,10 @@
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
-import { BookStatus, OfferType, SourceFormat } from '@prisma/client';
+import {
+  BookStatus,
+  ChainWalletCustodyType,
+  OfferType,
+  SourceFormat,
+} from '@prisma/client';
 import { Type } from 'class-transformer';
 import {
   ArrayMaxSize,
@@ -48,8 +53,8 @@ export class UpsertOfferDto {
 
   @ApiProperty()
   @IsInt()
-  @Min(100)
-  priceInKobo!: number;
+  @Min(1)
+  priceInUsdcMinor!: number;
 
   @ApiPropertyOptional()
   @IsOptional()
@@ -67,6 +72,29 @@ export class UpsertOfferDto {
   @IsOptional()
   @IsBoolean()
   isActive?: boolean;
+}
+
+export class PublishChapterDto {
+  @ApiProperty()
+  @IsBoolean()
+  isFree!: boolean;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  priceInUsdcMinor?: number;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  maxCopies?: number;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  sellerWalletId?: string;
 }
 
 export class ChapterChecklistItemDto {
@@ -148,10 +176,24 @@ export class PublicBookChapterDto {
   isFree!: boolean;
 
   @ApiProperty()
+  wordCount!: number;
+
+  @ApiProperty()
+  estimatedReadMinutes!: number;
+
+  @ApiProperty()
   isPublished!: boolean;
 
   @ApiProperty()
   isUnlocked!: boolean;
+
+  @ApiPropertyOptional()
+  edition?: {
+    maxCopies: number;
+    mintedCopies: number;
+    priceInUsdcMinor: number;
+    formattedPrice: string;
+  } | null;
 }
 
 export class PublicBookDto {
@@ -178,6 +220,13 @@ export class PublicBookDto {
   @ApiPropertyOptional()
   coverImageUrl?: string | null;
 
+  @ApiPropertyOptional()
+  collection?: {
+    mintAddress: string;
+    metadataAddress: string;
+    metadataUri?: string | null;
+  } | null;
+
   @ApiProperty({
     enum: BookStatus,
   })
@@ -199,6 +248,7 @@ export class PublicBookDto {
     type: OfferType;
     title: string;
     description: string;
+    priceInUsdcMinor: number;
     formattedPrice: string;
   }>;
 }
@@ -214,10 +264,27 @@ export class ReaderChapterDto {
   chapterNumber!: number;
 
   @ApiProperty()
+  wordCount!: number;
+
+  @ApiProperty()
+  estimatedReadMinutes!: number;
+
+  @ApiProperty()
   renderedHtml!: string;
 
   @ApiProperty()
   progressPercent!: number;
+
+  @ApiPropertyOptional()
+  ownership?: {
+    required: boolean;
+    owned: boolean;
+    ownerWalletAddress?: string | null;
+    editionSupply?: {
+      mintedCopies: number;
+      maxCopies: number;
+    } | null;
+  };
 }
 
 export class UpsertProgressDto {
@@ -240,4 +307,17 @@ export class UpsertProgressDto {
   @Min(0)
   @Max(100)
   progressPercent!: number;
+}
+
+export class WalletSummaryDto {
+  @ApiProperty()
+  address!: string;
+
+  @ApiProperty()
+  label!: string;
+
+  @ApiProperty({
+    enum: ChainWalletCustodyType,
+  })
+  custodyType!: ChainWalletCustodyType;
 }

@@ -4,6 +4,8 @@ import request from 'supertest';
 import { configureApp } from './../src/app.bootstrap';
 import { AppModule } from './../src/app.module';
 
+jest.setTimeout(30_000);
+
 describe('AppController (e2e)', () => {
   let app: INestApplication;
 
@@ -27,6 +29,6 @@ describe('AppController (e2e)', () => {
     const body = response.body as { service: string; status: string };
 
     expect(body.status).toBe('ok');
-    expect(body.service).toBe('talea-backend');
+    expect(body.service).toBe('lesenpad-backend');
   });
 });

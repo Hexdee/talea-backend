@@ -2,6 +2,7 @@ import {
   Body,
   Controller,
   Get,
+  Patch,
   Post,
   UseGuards,
   Version,
@@ -13,6 +14,9 @@ import type { SessionUser } from '../common/types/authenticated-request';
 import {
   CreatePayoutAccountDto,
   CreatePayoutRequestDto,
+  LinkExternalWalletDto,
+  SetDefaultWalletDto,
+  VerifyDepositDto,
 } from './dto/wallet.dto';
 import { WalletService } from './wallet.service';
 
@@ -26,6 +30,24 @@ export class WalletController {
   @Version('1')
   getWallet(@CurrentUser() user: SessionUser) {
     return this.walletService.getWallet(user.id);
+  }
+
+  @Post('chain-wallets/external')
+  @Version('1')
+  linkExternalWallet(
+    @CurrentUser() user: SessionUser,
+    @Body() dto: LinkExternalWalletDto,
+  ) {
+    return this.walletService.linkExternalWallet(user.id, dto);
+  }
+
+  @Patch('chain-wallets/default')
+  @Version('1')
+  setDefaultWallet(
+    @CurrentUser() user: SessionUser,
+    @Body() dto: SetDefaultWalletDto,
+  ) {
+    return this.walletService.setDefaultWallet(user.id, dto.walletId);
   }
 
   @Post('payout-accounts')
@@ -44,5 +66,20 @@ export class WalletController {
     @Body() dto: CreatePayoutRequestDto,
   ) {
     return this.walletService.createPayoutRequest(user.id, dto);
+  }
+
+  @Post('deposits/refresh')
+  @Version('1')
+  refreshDeposits(@CurrentUser() user: SessionUser) {
+    return this.walletService.refreshDeposits(user.id);
+  }
+
+  @Post('deposits/verify')
+  @Version('1')
+  verifyDeposit(
+    @CurrentUser() user: SessionUser,
+    @Body() dto: VerifyDepositDto,
+  ) {
+    return this.walletService.verifyDeposit(user.id, dto);
   }
 }

@@ -18,7 +18,7 @@ export class HealthController {
   getHealth(): HealthResponseDto {
     return {
       status: 'ok',
-      service: 'talea-backend',
+      service: 'lesenpad-backend',
       timestamp: new Date().toISOString(),
     };
   }

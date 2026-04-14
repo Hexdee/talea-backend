@@ -11,22 +11,35 @@ import { ApiTags } from '@nestjs/swagger';
 import { CurrentUser } from '../auth/decorators/current-user.decorator';
 import { SessionAuthGuard } from '../auth/guards/session-auth.guard';
 import type { SessionUser } from '../common/types/authenticated-request';
-import { CreateDemoPaymentDto } from './dto/payment.dto';
+import {
+  CompleteSolanaPaymentDto,
+  CreateSolanaPaymentDto,
+  QuotePurchaseDto,
+} from './dto/payment.dto';
 import { PaymentsService } from './payments.service';
 
 @ApiTags('payments')
-@Controller('payments/demo')
+@Controller('payments/solana')
 @UseGuards(SessionAuthGuard)
 export class PaymentsController {
   constructor(private readonly paymentsService: PaymentsService) {}
+
+  @Post('quote')
+  @Version('1')
+  quotePurchase(
+    @CurrentUser() user: SessionUser,
+    @Body() dto: QuotePurchaseDto,
+  ) {
+    return this.paymentsService.quotePurchase(user.id, dto);
+  }
 
   @Post('intents')
   @Version('1')
   createIntent(
     @CurrentUser() user: SessionUser,
-    @Body() dto: CreateDemoPaymentDto,
+    @Body() dto: CreateSolanaPaymentDto,
   ) {
-    return this.paymentsService.createDemoIntent(user.id, dto);
+    return this.paymentsService.createIntent(user.id, dto);
   }
 
   @Post('intents/:reference/complete')
@@ -34,8 +47,9 @@ export class PaymentsController {
   completeIntent(
     @CurrentUser() user: SessionUser,
     @Param('reference') reference: string,
+    @Body() dto: CompleteSolanaPaymentDto,
   ) {
-    return this.paymentsService.completeDemoIntent(user.id, reference);
+    return this.paymentsService.completeIntent(user.id, reference, dto);
   }
 
   @Get('history')

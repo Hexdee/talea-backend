@@ -1,13 +1,15 @@
 import {
   AuthAccountProvider,
+  BlogStatus,
   BookStatus,
-  OfferType,
   PrismaClient,
   Role,
   SourceFormat,
   WalletTransactionType,
 } from '@prisma/client';
+import { Keypair } from '@solana/web3.js';
 import * as bcrypt from 'bcryptjs';
+import { createCipheriv, createHash, randomBytes } from 'node:crypto';
 
 const prisma = new PrismaClient();
 
@@ -29,30 +31,84 @@ type SeedBook = {
   chapterCount: number;
 };
 
-type SeedOffer = {
+type SeedBlogPost = {
   title: string;
-  description: string;
-  type: OfferType;
-  priceInKobo: number;
-  chapterStart?: number;
-  chapterEnd?: number;
+  slug: string;
+  excerpt: string;
+  contentHtml: string;
+  tags: string[];
+  status: BlogStatus;
 };
 
 type CreatedBookWithAuthor = Awaited<ReturnType<typeof createBook>> & {
   authorId: string;
 };
 
+const masterKey = createHash('sha256')
+  .update(process.env.CHAIN_MASTER_KEY || 'lesenpad-dev-chain-master-key')
+  .digest();
+
+function hashString(value: string) {
+  return createHash('sha256').update(value).digest('hex');
+}
+
+function encryptString(value: string, key = masterKey) {
+  const iv = randomBytes(12);
+  const cipher = createCipheriv('aes-256-gcm', key, iv);
+  const encrypted = Buffer.concat([
+    cipher.update(value, 'utf8'),
+    cipher.final(),
+  ]);
+
+  return JSON.stringify({
+    iv: iv.toString('base64'),
+    tag: cipher.getAuthTag().toString('base64'),
+    value: encrypted.toString('base64'),
+  });
+}
+
+function encryptPayload(payload: string) {
+  const contentKey = randomBytes(32);
+  const iv = randomBytes(12);
+  const cipher = createCipheriv('aes-256-gcm', contentKey, iv);
+  const encrypted = Buffer.concat([
+    cipher.update(Buffer.from(payload, 'utf8')),
+    cipher.final(),
+  ]);
+
+  return {
+    encryptedContentKey: encryptString(contentKey.toString('base64')),
+    encryptedPayloadBase64: JSON.stringify({
+      iv: iv.toString('base64'),
+      tag: cipher.getAuthTag().toString('base64'),
+      value: encrypted.toString('base64'),
+    }),
+    cipherSpec: 'aes-256-gcm:v1',
+  };
+}
+
+function createCustodialWallet() {
+  const keypair = Keypair.generate();
+
+  return {
+    address: keypair.publicKey.toBase58(),
+    encryptedPrivateKey: encryptString(
+      Buffer.from(keypair.secretKey).toString('base64'),
+    ),
+  };
+}
+
 const authors: SeedAuthor[] = [
-  { email: 'nora@talea.dev', displayName: 'Nora Vale' },
-  { email: 'ibukun@talea.dev', displayName: 'Ibukun Sade' },
-  { email: 'amara@talea.dev', displayName: 'Amara Quaye' },
-  { email: 'tunde@talea.dev', displayName: 'Tunde Arinze' },
-  { email: 'leila@talea.dev', displayName: 'Leila Nwosu' },
-  { email: 'miriam@talea.dev', displayName: 'Miriam Cole' },
-  { email: 'kofi@talea.dev', displayName: 'Kofi Badu' },
-  { email: 'adaeze@talea.dev', displayName: 'Adaeze Mbanefo' },
-  { email: 'hana@talea.dev', displayName: 'Hana Okoye' },
-  { email: 'seyi@talea.dev', displayName: 'Seyi Daramola' },
+  { email: 'nora@lesenpad.dev', displayName: 'Nora Vale' },
+  { email: 'ibukun@lesenpad.dev', displayName: 'Ibukun Sade' },
+  { email: 'amara@lesenpad.dev', displayName: 'Amara Quaye' },
+  { email: 'tunde@lesenpad.dev', displayName: 'Tunde Arinze' },
+  { email: 'leila@lesenpad.dev', displayName: 'Leila Nwosu' },
+  { email: 'miriam@lesenpad.dev', displayName: 'Miriam Cole' },
+  { email: 'kofi@lesenpad.dev', displayName: 'Kofi Badu' },
+  { email: 'adaeze@lesenpad.dev', displayName: 'Adaeze Mbanefo' },
+  { email: 'hana@lesenpad.dev', displayName: 'Hana Okoye' },
+  { email: 'seyi@lesenpad.dev', displayName: 'Seyi Daramola' },
 ];
 
 const bookCatalog: SeedBook[] = [
@@ -518,14 +574,76 @@ const bookCatalog: SeedBook[] = [
   },
 ];
 
+const blogPosts: SeedBlogPost[] = [
+  {
+    title: 'Serial Stories Need Editorial Rituals',
+    slug: 'serial-stories-editorial-rituals',
+    excerpt:
+      'Episodic publishing thrives when creators repeat the same editorial rituals between chapters.',
+    contentHtml: `
+      <p>Serialized publishing rewards consistency. The biggest wins come from rituals that are repeated every time a chapter drops: a clean handoff from draft to edit, a tone pass, and a release checklist.</p>
+      <h2>Rituals keep momentum alive</h2>
+      <p>When teams ritualize the same editorial steps, they protect launch energy and reduce the cognitive load that slows writers down.</p>
+      <blockquote>Consistency is the most powerful kind of creative momentum.</blockquote>
+      <h3>What to standardize</h3>
+      <ul>
+        <li>Pre-publish QA and fact checks.</li>
+        <li>CTA placement for reader engagement.</li>
+        <li>Release notes that explain what changed.</li>
+      </ul>
+    `,
+    tags: ['editorial', 'craft', 'serial'],
+    status: BlogStatus.PUBLISHED,
+  },
+  {
+    title: 'Designing the Lesenpad Creator Loop',
+    slug: 'lesenpad-creator-loop',
+    excerpt:
+      'Our product decisions focus on the loop that keeps authors writing, readers subscribing, and communities growing.',
+    contentHtml: `
+      <p>At Lesenpad, we track a simple loop: draft, publish, engage, repeat. Every product decision is measured by how much friction it removes from that loop.</p>
+      <h2>What we learned</h2>
+      <p>Creators want fewer dashboards and more momentum. Readers want a sense of ritual and discovery.</p>
+      <h3>Next up</h3>
+      <p>We are investing in analytics that surface what readers are waiting for - before creators have to ask.</p>
+    `,
+    tags: ['product', 'community'],
+    status: BlogStatus.PUBLISHED,
+  },
+  {
+    title: 'How We Measure Reading Momentum',
+    slug: 'measuring-reading-momentum',
+    excerpt:
+      'Reading momentum is the combination of release cadence, cliffhangers, and how often readers return.',
+    contentHtml: `
+      <p>Momentum is not a single metric. It is the relationship between release cadence, chapter length, and reader behavior.</p>
+      <h2>Signals we monitor</h2>
+      <ul>
+        <li>Return frequency after each release.</li>
+        <li>Completion rate by chapter.</li>
+        <li>Comment sentiment that signals momentum.</li>
+      </ul>
+      <p>These signals help us guide creators toward more reliable cadence planning.</p>
+    `,
+    tags: ['analytics', 'strategy'],
+    status: BlogStatus.DRAFT,
+  },
+];
+
 async function resetDatabase() {
+  await prisma.ownershipVerificationCache.deleteMany();
+  await prisma.onchainTransaction.deleteMany();
+  await prisma.purchaseReservation.deleteMany();
+  await prisma.chapterToken.deleteMany();
+  await prisma.chapterEdition.deleteMany();
+  await prisma.encryptedChapterBlob.deleteMany();
   await prisma.payoutRequest.deleteMany();
   await prisma.payoutAccount.deleteMany();
+  await prisma.userChainWallet.deleteMany();
   await prisma.walletTransaction.deleteMany();
   await prisma.wallet.deleteMany();
   await prisma.readingProgress.deleteMany();
   await prisma.libraryItem.deleteMany();
-  await prisma.entitlement.deleteMany();
   await prisma.payment.deleteMany();
   await prisma.orderItem.deleteMany();
   await prisma.order.deleteMany();
@@ -533,6 +651,7 @@ async function resetDatabase() {
   await prisma.offer.deleteMany();
   await prisma.chapter.deleteMany();
   await prisma.book.deleteMany();
+  await prisma.blogPost.deleteMany();
   await prisma.session.deleteMany();
   await prisma.authAccount.deleteMany();
   await prisma.user.deleteMany();
@@ -545,6 +664,7 @@ async function createUser(params: {
   password: string;
 }) {
   const passwordHash = await bcrypt.hash(params.password, 10);
+  const custodialWallet = createCustodialWallet();
 
   return prisma.user.create({
     data: {
@@ -560,6 +680,16 @@ async function createUser(params: {
       },
       wallet: {
         create: {},
+      },
+      chainWallets: {
+        create: {
+          address: custodialWallet.address,
+          label: 'Lesenpad custodial wallet',
+          custodyType: 'CUSTODIAL',
+          encryptedPrivateKey: custodialWallet.encryptedPrivateKey,
+          isDefault: true,
+          isCreatorPayoutWallet: true,
+        },
       },
     },
   });
@@ -607,51 +737,25 @@ function buildChapterHtml(
   return blocks.join('');
 }
 
-function buildOffers(book: SeedBook) {
-  const basePrice = 900 + (book.chapterCount % 5) * 150;
-  const offers: SeedOffer[] = [
-    {
-      title: `${book.title} chapter unlock`,
-      description: 'Unlock the next paid chapter immediately.',
-      type: OfferType.SINGLE_CHAPTER,
-      priceInKobo: basePrice,
-      chapterStart: 2,
-      chapterEnd: 2,
-    },
-    {
-      title: `${book.title} starter bundle`,
-      description: 'Unlock a discounted early arc bundle.',
-      type: OfferType.CHAPTER_BUNDLE,
-      priceInKobo: basePrice * 2 + 250,
-      chapterStart: 2,
-      chapterEnd: Math.min(4, book.chapterCount),
-    },
-  ];
+function stripHtml(value: string) {
+  return value
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
 
-  if (book.chapterCount >= 7) {
-    offers.push({
-      title: `${book.title} mid-run bundle`,
-      description: 'Keep momentum with a larger chapter bundle.',
-      type: OfferType.CHAPTER_BUNDLE,
-      priceInKobo: basePrice * 3 + 700,
-      chapterStart: 5,
-      chapterEnd: Math.min(7, book.chapterCount),
-    });
-  }
-
-  if (book.status === BookStatus.COMPLETED) {
-    offers.push({
-      title: `${book.title} full book unlock`,
-      description: 'Unlock every completed chapter in one purchase.',
-      type: OfferType.FULL_BOOK,
-      priceInKobo: basePrice * Math.max(3, Math.ceil(book.chapterCount / 2)),
-    });
-  }
-
-  return offers;
+function estimateReadingTimeMinutes(text: string) {
+  const words = text.split(/\s+/).filter(Boolean).length;
+  return Math.max(1, Math.ceil(words / 220));
 }
 
 async function createBook(params: { authorId: string; book: SeedBook }) {
+  const sellerWallet = await prisma.userChainWallet.findFirstOrThrow({
+    where: {
+      userId: params.authorId,
+      isDefault: true,
+    },
+  });
   const chapters = Array.from(
     { length: params.book.chapterCount },
     (_, index) => {
@@ -662,6 +766,8 @@ async function createBook(params: { authorId: string; book: SeedBook }) {
         chapterTitle,
         chapterNumber,
       );
+      const plainText = stripHtml(chapterHtml);
+      const wordCount = plainText.split(/\s+/).filter(Boolean).length;
 
       return {
         title: chapterTitle,
@@ -670,6 +776,9 @@ async function createBook(params: { authorId: string; book: SeedBook }) {
         isFree: chapterNumber === 1,
         draftFormat: SourceFormat.RICH_TEXT_HTML,
         draftContent: chapterHtml,
+        wordCount,
+        estimatedReadMinutes: estimateReadingTimeMinutes(plainText),
+        publishedRevision: 1,
         publishedFormat: SourceFormat.RICH_TEXT_HTML,
         publishedContent: chapterHtml,
         publishedRenderedHtml: chapterHtml,
@@ -680,7 +789,7 @@ async function createBook(params: { authorId: string; book: SeedBook }) {
     },
   );
 
-  return prisma.book.create({
+  const createdBook = await prisma.book.create({
     data: {
       authorId: params.authorId,
       title: params.book.title,
@@ -693,12 +802,101 @@ async function createBook(params: { authorId: string; book: SeedBook }) {
       chapters: {
         create: chapters,
       },
-      offers: {
-        create: buildOffers(params.book),
-      },
     },
     include: {
       chapters: {
+        orderBy: {
+          chapterNumber: 'asc',
+        },
+      },
+    },
+  });
+
+  for (const chapter of createdBook.chapters.filter((item) => !item.isFree)) {
+    const basePrice = 1_200_000 + (chapter.chapterNumber % 4) * 250_000;
+    const payload = JSON.stringify({
+      metadata: {
+        chapterId: chapter.id,
+        chapterTitle: chapter.title,
+        chapterNumber: chapter.chapterNumber,
+        bookTitle: createdBook.title,
+        bookSlug: createdBook.slug,
+      },
+      renderedHtml: chapter.publishedRenderedHtml,
+    });
+    const encrypted = encryptPayload(payload);
+    const ipfsCid = `bafy${hashString(payload).slice(0, 42)}`;
+    const revisionHash = hashString(
+      `${chapter.id}:${chapter.publishedRevision}:${chapter.publishedRenderedHtml}`,
+    );
+
+    await prisma.encryptedChapterBlob.create({
+      data: {
+        chapterId: chapter.id,
+        revision: chapter.publishedRevision,
+        ipfsCid,
+        encryptedContentKey: encrypted.encryptedContentKey,
+        encryptedPayloadBase64: encrypted.encryptedPayloadBase64,
+        cipherSpec: encrypted.cipherSpec,
+        plaintextHash: hashString(chapter.publishedRenderedHtml ?? ''),
+        metadataJson: {
+          sellerWalletAddress: sellerWallet.address,
+          network: 'devnet',
+        },
+      },
+    });
+
+    const edition = await prisma.chapterEdition.create({
+      data: {
+        chapterId: chapter.id,
+        masterMintAddress: Keypair.generate().publicKey.toBase58(),
+        metadataAddress: Keypair.generate().publicKey.toBase58(),
+        collectionMintAddress: Keypair.generate().publicKey.toBase58(),
+        maxCopies: 240,
+        mintedCopies: 0,
+        priceInUsdcMinor: basePrice,
+        sellerWalletAddress: sellerWallet.address,
+        ipfsCid,
+        publishedRevisionHash: revisionHash,
+      },
+    });
+
+    await prisma.offer.create({
+      data: {
+        bookId: createdBook.id,
+        chapterId: chapter.id,
+        type: 'SINGLE_CHAPTER',
+        title: `Chapter ${chapter.chapterNumber}`,
+        description: `${chapter.title} · limited onchain edition`,
+        priceInUsdcMinor: basePrice,
+        currency: 'USDC',
+        chapterStart: chapter.chapterNumber,
+        chapterEnd: chapter.chapterNumber,
+      },
+    });
+
+    await prisma.onchainTransaction.create({
+      data: {
+        signature: `seed-meta-${edition.masterMintAddress}`,
+        network: 'devnet',
+        txType: 'METADATA_CREATE',
+        status: 'CONFIRMED',
+        userId: params.authorId,
+        bookId: createdBook.id,
+        chapterId: chapter.id,
+      },
+    });
+  }
+
+  return prisma.book.findUniqueOrThrow({
+    where: {
+      id: createdBook.id,
+    },
+    include: {
+      chapters: {
+        include: {
+          edition: true,
+        },
         orderBy: {
           chapterNumber: 'asc',
         },
@@ -708,10 +906,30 @@ async function createBook(params: { authorId: string; book: SeedBook }) {
   });
 }
 
+async function createBlogPosts(authorId: string) {
+  for (const post of blogPosts) {
+    const contentText = stripHtml(post.contentHtml);
+    await prisma.blogPost.create({
+      data: {
+        title: post.title,
+        slug: post.slug,
+        excerpt: post.excerpt,
+        contentHtml: post.contentHtml,
+        contentText,
+        tags: post.tags,
+        status: post.status,
+        publishedAt: post.status === BlogStatus.PUBLISHED ? new Date() : null,
+        readingTimeMinutes: estimateReadingTimeMinutes(contentText),
+        authorId,
+      },
+    });
+  }
+}
+
 async function seedAnalytics(bookId: string, index: number) {
   const baseViews = 180 + index * 36;
   const basePurchases = 10 + (index % 6) * 4;
-  const baseRevenue = (18 + index) * 1000;
+  const baseRevenue = (18 + index) * 1_250_000;
 
   await prisma.analyticsSnapshot.createMany({
     data: [
@@ -720,7 +938,7 @@ async function seedAnalytics(bookId: string, index: number) {
         date: new Date('2026-03-20'),
         views: baseViews,
         purchases: basePurchases,
-        revenueInKobo: baseRevenue,
+        revenueInUsdcMinor: baseRevenue,
         completionRate: 52 + (index % 20),
         activeReaders: 44 + index * 2,
       },
@@ -729,7 +947,7 @@ async function seedAnalytics(bookId: string, index: number) {
         date: new Date('2026-03-24'),
         views: baseViews + 80,
         purchases: basePurchases + 6,
-        revenueInKobo: baseRevenue + 6500,
+        revenueInUsdcMinor: baseRevenue + 6_500_000,
         completionRate: 56 + (index % 18),
         activeReaders: 58 + index * 3,
       },
@@ -742,32 +960,56 @@ async function seedReaderPurchase(params: {
   book: Awaited<ReturnType<typeof createBook>>;
   orderIndex: number;
 }) {
-  const offer =
-    params.book.offers.find((item) => item.type === OfferType.FULL_BOOK) ??
-    params.book.offers.find((item) => item.type === OfferType.CHAPTER_BUNDLE) ??
-    params.book.offers[0];
+  const readerWallet = await prisma.userChainWallet.findFirstOrThrow({
+    where: {
+      userId: params.readerId,
+      isDefault: true,
+    },
+  });
+  const chaptersToBuy = params.book.chapters
+    .filter((chapter) => !chapter.isFree)
+    .slice(0, 2 + (params.orderIndex % 2));
 
-  if (!offer) {
+  if (chaptersToBuy.length === 0) {
     return 0;
   }
+
+  const offers = params.book.offers.filter((offer) =>
+    chaptersToBuy.some((chapter) => chapter.id === offer.chapterId),
+  );
+  const totalAmountInUsdcMinor = offers.reduce(
+    (sum, offer) => sum + offer.priceInUsdcMinor,
+    0,
+  );
 
   const order = await prisma.order.create({
     data: {
       userId: params.readerId,
       status: 'COMPLETED',
-      totalAmountInKobo: offer.priceInKobo,
-      customerEmail: 'reader@talea.dev',
+      totalAmountInUsdcMinor,
+      currency: 'USDC',
+      customerEmail: 'reader@lesenpad.dev',
       items: {
-        create: {
-          offerId: offer.id,
-          amountInKobo: offer.priceInKobo,
-        },
+        create: offers.map((offer) => {
+          const chapter = chaptersToBuy.find(
+            (item) => item.id === offer.chapterId,
+          )!;
+          return {
+            offerId: offer.id,
+            chapterId: chapter.id,
+            chapterEditionId: chapter.edition?.id,
+            amountInUsdcMinor: offer.priceInUsdcMinor,
+          };
+        }),
       },
       payment: {
         create: {
           reference: `SEED-PAY-${params.orderIndex + 1}`,
-          amountInKobo: offer.priceInKobo,
+          amountInUsdcMinor: totalAmountInUsdcMinor,
+          currency: 'USDC',
           status: 'SUCCEEDED',
+          provider: 'SOLANA_USDC',
+          payerWalletAddress: readerWallet.address,
           paidAt: new Date(
             `2026-03-${String((params.orderIndex % 8) + 12).padStart(2, '0')}`,
           ),
@@ -776,16 +1018,34 @@ async function seedReaderPurchase(params: {
     },
   });
 
-  await prisma.entitlement.create({
-    data: {
-      userId: params.readerId,
-      bookId: params.book.id,
-      offerId: offer.id,
-      chapterStart: offer.chapterStart,
-      chapterEnd: offer.chapterEnd,
-      fullBook: offer.type === OfferType.FULL_BOOK,
-    },
-  });
+  for (const chapter of chaptersToBuy) {
+    const edition = chapter.edition!;
+    const mintedCopies = edition.mintedCopies + 1;
+    const mintAddress = Keypair.generate().publicKey.toBase58();
+    await prisma.chapterEdition.update({
+      where: {
+        id: edition.id,
+      },
+      data: {
+        mintedCopies,
+      },
+    });
+
+    await prisma.chapterToken.create({
+      data: {
+        chapterId: chapter.id,
+        editionId: edition.id,
+        ownerUserId: params.readerId,
+        ownerWalletId: readerWallet.id,
+        ownerWalletAddress: readerWallet.address,
+        mintAddress,
+        tokenAccountAddress: Keypair.generate().publicKey.toBase58(),
+        serialNumber: mintedCopies,
+        mintTxSignature: `seed-mint-${mintAddress}`,
+        currentOwnershipVerifiedAt: new Date(),
+      },
+    });
+  }
 
   await prisma.libraryItem.create({
     data: {
@@ -814,7 +1074,7 @@ async function seedReaderPurchase(params: {
     },
   });
 
-  return order.totalAmountInKobo;
+  return order.totalAmountInUsdcMinor;
 }
 
 async function main() {
@@ -825,18 +1085,27 @@ async function main() {
       createUser({
         email: author.email,
         displayName: author.displayName,
-        roles: [Role.READER, Role.AUTHOR],
+        roles: [Role.USER],
         password: 'authorpass123',
       }),
     ),
   );
 
   const reader = await createUser({
-    email: 'reader@talea.dev',
+    email: 'reader@lesenpad.dev',
     displayName: 'Ayo Reader',
-    roles: [Role.READER],
+    roles: [Role.USER],
     password: 'readerpass123',
   });
+
+  const superadmin = await createUser({
+    email: 'superadmin@lesenpad.dev',
+    displayName: 'Lesenpad Superadmin',
+    roles: [Role.USER, Role.SUPERADMIN],
+    password: 'superadminpass123',
+  });
+
+  await createBlogPosts(superadmin.id);
 
   const createdBooks: CreatedBookWithAuthor[] = [];
 
@@ -868,7 +1137,7 @@ async function main() {
   const revenueByAuthor = new Map<string, number>();
 
   for (const [index, book] of createdBooks.entries()) {
-    const bookRevenue = (18 + index) * 1000 + 6500;
+    const bookRevenue = (18 + index) * 1_250_000 + 6_500_000;
     revenueByAuthor.set(
       book.authorId,
       (revenueByAuthor.get(book.authorId) ?? 0) + bookRevenue,
@@ -880,11 +1149,11 @@ async function main() {
       prisma.wallet.update({
         where: { userId: author.id },
         data: {
-          availableBalanceInKobo: revenueByAuthor.get(author.id) ?? 0,
+          availableBalanceInUsdcMinor: revenueByAuthor.get(author.id) ?? 0,
           transactions: {
             create: {
               type: WalletTransactionType.SALE,
-              amountInKobo: revenueByAuthor.get(author.id) ?? 0,
+              amountInUsdcMinor: revenueByAuthor.get(author.id) ?? 0,
               reference: `SEED-SALE-${index + 1}`,
               description: `Seed revenue across ${createdBooks.filter((book) => book.authorId === author.id).length} books`,
             },
@@ -900,9 +1169,9 @@ async function main() {
       transactions: {
         create: {
           type: WalletTransactionType.ADJUSTMENT,
-          amountInKobo: seededReaderSpend,
+          amountInUsdcMinor: seededReaderSpend,
           reference: 'SEED-READER-SPEND',
-          description: 'Demo purchase history across the Talea catalog',
+          description: 'Demo purchase history across the Lesenpad catalog',
         },
       },
     },
@@ -913,6 +1182,8 @@ async function main() {
       prisma.payoutAccount.create({
         data: {
           userId: author.id,
+          destinationType: 'BANK',
+          label: 'Primary bank account',
           bankName: ['Moniepoint', 'Kuda', 'GTBank', 'Access Bank'][index],
           accountName: author.displayName,
           accountNumberMasked: `***${8452 + index}`,

@@ -15,7 +15,11 @@ import { OptionalSessionAuthGuard } from '../auth/guards/optional-session-auth.g
 import { SessionAuthGuard } from '../auth/guards/session-auth.guard';
 import type { SessionUser } from '../common/types/authenticated-request';
 import { BooksService } from '../books/books.service';
-import { ReorderChaptersDto, UpsertChapterDto } from '../books/dto/book.dto';
+import {
+  PublishChapterDto,
+  ReorderChaptersDto,
+  UpsertChapterDto,
+} from '../books/dto/book.dto';
 
 @ApiTags('chapters')
 @Controller()
@@ -63,8 +67,9 @@ export class ChaptersController {
     @CurrentUser() user: SessionUser,
     @Param('bookId') bookId: string,
     @Param('chapterId') chapterId: string,
+    @Body() dto: PublishChapterDto,
   ) {
-    return this.booksService.publishChapter(user.id, bookId, chapterId);
+    return this.booksService.publishChapter(user.id, bookId, chapterId, dto);
   }
 
   @Post('books/:bookId/chapters/:chapterId/duplicate')

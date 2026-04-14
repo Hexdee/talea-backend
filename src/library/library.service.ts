@@ -13,6 +13,14 @@ export class LibraryService {
       include: {
         book: {
           include: {
+            chapters: {
+              include: {
+                edition: true,
+              },
+              orderBy: {
+                chapterNumber: 'asc',
+              },
+            },
             offers: {
               where: {
                 isActive: true,
@@ -28,16 +36,21 @@ export class LibraryService {
   }
 
   async getEntitlements(userId: string) {
-    return this.prisma.entitlement.findMany({
+    return this.prisma.chapterToken.findMany({
       where: {
-        userId,
+        ownerUserId: userId,
       },
       include: {
-        offer: true,
-        book: true,
+        chapter: {
+          include: {
+            book: true,
+            offer: true,
+          },
+        },
+        edition: true,
       },
       orderBy: {
-        grantedAt: 'desc',
+        createdAt: 'desc',
       },
     });
   }

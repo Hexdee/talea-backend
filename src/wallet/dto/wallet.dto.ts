@@ -1,31 +1,85 @@
 import { ApiProperty } from '@nestjs/swagger';
-import { IsInt, IsString, Min } from 'class-validator';
+import { WithdrawalDestinationType } from '@prisma/client';
+import {
+  IsBoolean,
+  IsEnum,
+  IsInt,
+  IsOptional,
+  IsString,
+  Min,
+} from 'class-validator';
+
+export class LinkExternalWalletDto {
+  @ApiProperty()
+  @IsString()
+  address!: string;
+
+  @ApiProperty()
+  @IsString()
+  label!: string;
+
+  @ApiProperty({ required: false })
+  @IsOptional()
+  @IsBoolean()
+  makeDefault?: boolean;
+}
+
+export class SetDefaultWalletDto {
+  @ApiProperty()
+  @IsString()
+  walletId!: string;
+}
 
 export class CreatePayoutAccountDto {
-  @ApiProperty()
-  @IsString()
-  bankName!: string;
+  @ApiProperty({
+    enum: WithdrawalDestinationType,
+  })
+  @IsEnum(WithdrawalDestinationType)
+  destinationType!: WithdrawalDestinationType;
 
   @ApiProperty()
   @IsString()
-  accountName!: string;
+  label!: string;
 
-  @ApiProperty()
+  @ApiProperty({ required: false })
+  @IsOptional()
   @IsString()
-  accountNumberMasked!: string;
+  bankName?: string;
 
-  @ApiProperty()
+  @ApiProperty({ required: false })
+  @IsOptional()
   @IsString()
-  provider!: string;
+  accountName?: string;
+
+  @ApiProperty({ required: false })
+  @IsOptional()
+  @IsString()
+  accountNumberMasked?: string;
+
+  @ApiProperty({ required: false })
+  @IsOptional()
+  @IsString()
+  provider?: string;
+
+  @ApiProperty({ required: false })
+  @IsOptional()
+  @IsString()
+  walletAddress?: string;
 }
 
 export class CreatePayoutRequestDto {
   @ApiProperty()
   @IsInt()
-  @Min(1000)
-  amountInKobo!: number;
+  @Min(1)
+  amountInUsdcMinor!: number;
 
   @ApiProperty()
   @IsString()
   payoutAccountId!: string;
+}
+
+export class VerifyDepositDto {
+  @ApiProperty()
+  @IsString()
+  signature!: string;
 }

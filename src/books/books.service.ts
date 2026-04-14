@@ -2,14 +2,23 @@ import {
   BadRequestException,
   ForbiddenException,
   Injectable,
+  Logger,
   NotFoundException,
 } from '@nestjs/common';
-import { BookStatus, OfferType, Role } from '@prisma/client';
+import { BookStatus, OfferType, SourceFormat } from '@prisma/client';
 import type { SessionUser } from '../common/types/authenticated-request';
 import { renderPublishedHtml } from '../common/utils/content';
 import { formatCurrency } from '../common/utils/currency';
+import {
+  computeReadMetrics,
+  computeReadMetricsFromHtml,
+} from '../common/utils/read-time';
+import { IpfsService } from '../chain/ipfs.service';
+import { SolanaService } from '../chain/solana.service';
+import { VaultService } from '../chain/vault.service';
 import { PrismaService } from '../prisma/prisma.service';
 import {
+  PublishChapterDto,
   ReaderChapterDto,
   ReorderChaptersDto,
   type UpsertBookDto,
@@ -55,9 +64,40 @@ function normalizeChecklistItems(value: unknown): ChecklistItem[] {
     .slice(0, 12);
 }
 
+function getEncryptedPackagePayload(value: string, fallback: string): string {
+  const parsed = JSON.parse(value) as unknown;
+
+  if (
+    parsed &&
+    typeof parsed === 'object' &&
+    'payload' in parsed &&
+    typeof parsed.payload === 'string'
+  ) {
+    return parsed.payload;
+  }
+
+  return fallback;
+}
+
+function buildReadMetricsData(format: SourceFormat, content: string) {
+  const metrics = computeReadMetrics(format, content);
+
+  return {
+    wordCount: metrics.wordCount,
+    estimatedReadMinutes: metrics.estimatedReadMinutes,
+  };
+}
+
 @Injectable()
 export class BooksService {
-  constructor(private readonly prisma: PrismaService) {}
+  private readonly logger = new Logger(BooksService.name);
+
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly vaultService: VaultService,
+    private readonly ipfsService: IpfsService,
+    private readonly solanaService: SolanaService,
+  ) {}
 
   private async ensureUniqueChapterNumber(
     bookId: string,
@@ -101,10 +141,178 @@ export class BooksService {
     return book;
   }
 
-  private async getBookAccessMap(bookId: string, userId?: string) {
+  private async getActiveWallets(userId: string) {
+    return this.prisma.userChainWallet.findMany({
+      where: {
+        userId,
+        isActive: true,
+      },
+      orderBy: [{ isDefault: 'desc' }, { createdAt: 'asc' }],
+    });
+  }
+
+  async getDefaultWallet(userId: string, walletId?: string) {
+    if (walletId) {
+      const wallet = await this.prisma.userChainWallet.findFirst({
+        where: {
+          id: walletId,
+          userId,
+          isActive: true,
+        },
+      });
+
+      if (!wallet) {
+        throw new BadRequestException('Selected wallet could not be found.');
+      }
+
+      return wallet;
+    }
+
+    const wallet = await this.prisma.userChainWallet.findFirst({
+      where: {
+        userId,
+        isDefault: true,
+        isActive: true,
+      },
+    });
+
+    if (wallet) {
+      return wallet;
+    }
+
+    const fallback = await this.prisma.userChainWallet.findFirst({
+      where: {
+        userId,
+        isActive: true,
+      },
+      orderBy: {
+        createdAt: 'asc',
+      },
+    });
+
+    if (!fallback) {
+      throw new BadRequestException('No active Lesenpad wallet is available.');
+    }
+
+    return fallback;
+  }
+
+  private async ensureBookCollection(bookId: string) {
+    const book = await this.prisma.book.findUnique({
+      where: { id: bookId },
+      include: {
+        author: {
+          select: {
+            displayName: true,
+          },
+        },
+        chapters: {
+          where: {
+            publishedAt: {
+              not: null,
+            },
+          },
+          select: {
+            id: true,
+          },
+        },
+      },
+    });
+
+    if (!book) {
+      throw new NotFoundException('Book not found.');
+    }
+
+    if (
+      book.collectionMintAddress &&
+      book.collectionMetadataAddress &&
+      book.collectionMasterEditionAddress
+    ) {
+      return {
+        collectionMintAddress: book.collectionMintAddress,
+        collectionMetadataAddress: book.collectionMetadataAddress,
+        collectionMasterEditionAddress: book.collectionMasterEditionAddress,
+        collectionMetadataUri: book.collectionMetadataUri,
+        collectionMetadataCid: book.collectionMetadataCid,
+      };
+    }
+
+    if (
+      book.collectionMintAddress ||
+      book.collectionMetadataAddress ||
+      book.collectionMasterEditionAddress
+    ) {
+      throw new BadRequestException(
+        'Book collection metadata is incomplete. Repair the stored collection before publishing.',
+      );
+    }
+
+    const collectionMetadata = await this.ipfsService.uploadJson(
+      `${book.slug}-collection-metadata`,
+      {
+        name: `${book.title} Collection`,
+        symbol: 'LSPAD',
+        description: book.synopsis,
+        image: book.coverImageUrl ?? undefined,
+        properties: {
+          app: 'Lesenpad',
+          network: this.solanaService.getNetwork(),
+          bookId: book.id,
+          bookSlug: book.slug,
+          authorName: book.author.displayName,
+          genre: book.genre,
+          tags: book.tags,
+          publishedChapterCount: book.chapters.length,
+        },
+      },
+    );
+    const collectionAsset = await this.solanaService.createBookCollectionAsset({
+      name: `${book.title} Collection`,
+      uri: collectionMetadata.uri,
+    });
+
+    const updated = await this.prisma.book.update({
+      where: { id: bookId },
+      data: {
+        collectionMintAddress: collectionAsset.mintAddress,
+        collectionMetadataAddress: collectionAsset.metadataAddress,
+        collectionMasterEditionAddress: collectionAsset.masterEditionAddress,
+        collectionMetadataProvider: 'IPFS',
+        collectionMetadataCid: collectionMetadata.cid,
+        collectionMetadataUri:
+          collectionAsset.metadataUri ?? collectionMetadata.uri,
+      },
+    });
+
+    return {
+      collectionMintAddress: updated.collectionMintAddress!,
+      collectionMetadataAddress: updated.collectionMetadataAddress!,
+      collectionMasterEditionAddress: updated.collectionMasterEditionAddress!,
+      collectionMetadataUri: updated.collectionMetadataUri,
+      collectionMetadataCid: updated.collectionMetadataCid,
+    };
+  }
+
+  private async getOwnedChapterNumbers(bookId: string, userId?: string) {
     if (!userId) {
       return new Set<number>();
     }
+
+    const tokens = await this.prisma.chapterToken.findMany({
+      where: {
+        ownerUserId: userId,
+        chapter: {
+          bookId,
+        },
+      },
+      include: {
+        chapter: true,
+      },
+    });
+
+    const unlocked = new Set(
+      tokens.map((token) => token.chapter.chapterNumber),
+    );
 
     const entitlements = await this.prisma.entitlement.findMany({
       where: {
@@ -113,20 +321,28 @@ export class BooksService {
       },
     });
 
-    const unlocked = new Set<number>();
-
     for (const entitlement of entitlements) {
       if (entitlement.fullBook) {
-        unlocked.add(-1);
+        const bookChapters = await this.prisma.chapter.findMany({
+          where: {
+            bookId,
+            publishedAt: {
+              not: null,
+            },
+          },
+          select: {
+            chapterNumber: true,
+          },
+        });
+
+        for (const chapter of bookChapters) {
+          unlocked.add(chapter.chapterNumber);
+        }
+
         continue;
       }
 
-      if (
-        entitlement.chapterStart !== null &&
-        entitlement.chapterEnd !== null &&
-        entitlement.chapterStart !== undefined &&
-        entitlement.chapterEnd !== undefined
-      ) {
+      if (entitlement.chapterStart != null && entitlement.chapterEnd != null) {
         for (
           let chapterNumber = entitlement.chapterStart;
           chapterNumber <= entitlement.chapterEnd;
@@ -138,6 +354,118 @@ export class BooksService {
     }
 
     return unlocked;
+  }
+
+  private async serializePublicBook(
+    book: {
+      id: string;
+      slug: string;
+      title: string;
+      genre: string;
+      tags: string[];
+      synopsis: string;
+      coverImageUrl: string | null;
+      collectionMintAddress: string | null;
+      collectionMetadataAddress: string | null;
+      collectionMetadataUri: string | null;
+      status: BookStatus;
+      author: {
+        displayName: string;
+      };
+      chapters: Array<{
+        id: string;
+        title: string;
+        chapterNumber: number;
+        isFree: boolean;
+        wordCount: number;
+        estimatedReadMinutes: number;
+        publishedRenderedHtml: string | null;
+        publishedAt: Date | null;
+        edition: {
+          maxCopies: number;
+          mintedCopies: number;
+          priceInUsdcMinor: number;
+        } | null;
+      }>;
+      offers: Array<{
+        id: string;
+        type: OfferType;
+        title: string;
+        description: string;
+        priceInUsdcMinor: number;
+        currency: string;
+        chapterStart: number | null;
+        chapterEnd: number | null;
+      }>;
+    },
+    userId?: string,
+  ) {
+    const ownedChapterNumbers = await this.getOwnedChapterNumbers(
+      book.id,
+      userId,
+    );
+
+    return {
+      id: book.id,
+      slug: book.slug,
+      title: book.title,
+      genre: book.genre,
+      tags: book.tags,
+      synopsis: book.synopsis,
+      coverImageUrl: book.coverImageUrl,
+      collection:
+        book.collectionMintAddress && book.collectionMetadataAddress
+          ? {
+              mintAddress: book.collectionMintAddress,
+              metadataAddress: book.collectionMetadataAddress,
+              metadataUri: book.collectionMetadataUri,
+            }
+          : null,
+      status: book.status,
+      authorName: book.author.displayName,
+      chapters: book.chapters.map((chapter) => {
+        const readMetrics =
+          chapter.wordCount > 0
+            ? {
+                wordCount: chapter.wordCount,
+                estimatedReadMinutes: chapter.estimatedReadMinutes,
+              }
+            : computeReadMetricsFromHtml(chapter.publishedRenderedHtml ?? '');
+
+        return {
+          id: chapter.id,
+          title: chapter.title,
+          chapterNumber: chapter.chapterNumber,
+          isFree: chapter.isFree,
+          wordCount: readMetrics.wordCount,
+          estimatedReadMinutes: readMetrics.estimatedReadMinutes,
+          isPublished: Boolean(chapter.publishedAt),
+          isUnlocked:
+            chapter.isFree || ownedChapterNumbers.has(chapter.chapterNumber),
+          edition: chapter.edition
+            ? {
+                maxCopies: chapter.edition.maxCopies,
+                mintedCopies: chapter.edition.mintedCopies,
+                priceInUsdcMinor: chapter.edition.priceInUsdcMinor,
+                formattedPrice: formatCurrency(
+                  chapter.edition.priceInUsdcMinor,
+                  'USDC',
+                ),
+              }
+            : null,
+        };
+      }),
+      offers: book.offers.map((offer) => ({
+        id: offer.id,
+        type: offer.type,
+        title: offer.title,
+        description: offer.description,
+        priceInUsdcMinor: offer.priceInUsdcMinor,
+        formattedPrice: formatCurrency(offer.priceInUsdcMinor, offer.currency),
+        chapterStart: offer.chapterStart,
+        chapterEnd: offer.chapterEnd,
+      })),
+    };
   }
 
   async getFeaturedBooks(userId?: string) {
@@ -157,6 +485,9 @@ export class BooksService {
       include: {
         author: true,
         chapters: {
+          include: {
+            edition: true,
+          },
           orderBy: {
             chapterNumber: 'asc',
           },
@@ -166,66 +497,49 @@ export class BooksService {
             isActive: true,
           },
           orderBy: {
-            priceInKobo: 'asc',
+            priceInUsdcMinor: 'asc',
           },
         },
       },
       take,
     });
 
-    const accessMaps = new Map<string, Set<number>>();
-
-    for (const book of books) {
-      accessMaps.set(book.id, await this.getBookAccessMap(book.id, userId));
-    }
-
-    return books.map((book) => {
-      const unlocked = accessMaps.get(book.id) ?? new Set<number>();
-
-      return {
-        id: book.id,
-        slug: book.slug,
-        title: book.title,
-        genre: book.genre,
-        tags: book.tags,
-        synopsis: book.synopsis,
-        coverImageUrl: book.coverImageUrl,
-        status: book.status,
-        authorName: book.author.displayName,
-        chapters: book.chapters.map((chapter) => ({
-          id: chapter.id,
-          title: chapter.title,
-          chapterNumber: chapter.chapterNumber,
-          isFree: chapter.isFree,
-          isPublished: Boolean(chapter.publishedAt),
-          isUnlocked:
-            chapter.isFree ||
-            unlocked.has(-1) ||
-            unlocked.has(chapter.chapterNumber),
-        })),
-        offers: book.offers.map((offer) => ({
-          id: offer.id,
-          type: offer.type,
-          title: offer.title,
-          description: offer.description,
-          priceInKobo: offer.priceInKobo,
-          formattedPrice: formatCurrency(offer.priceInKobo, offer.currency),
-          chapterStart: offer.chapterStart,
-          chapterEnd: offer.chapterEnd,
-        })),
-      };
-    });
+    return Promise.all(
+      books.map((book) => this.serializePublicBook(book, userId)),
+    );
   }
 
   async getPublicBookBySlug(slug: string, userId?: string) {
-    const books = await this.listPublicBooks(userId);
-    const book = books.find((item) => item.slug === slug);
+    const book = await this.prisma.book.findUnique({
+      where: {
+        slug,
+      },
+      include: {
+        author: true,
+        chapters: {
+          include: {
+            edition: true,
+          },
+          orderBy: {
+            chapterNumber: 'asc',
+          },
+        },
+        offers: {
+          where: {
+            isActive: true,
+          },
+          orderBy: {
+            priceInUsdcMinor: 'asc',
+          },
+        },
+      },
+    });
 
-    if (!book) {
+    if (!book || book.status === BookStatus.DRAFT) {
       throw new NotFoundException('Book not found.');
     }
 
-    return book;
+    return this.serializePublicBook(book, userId);
   }
 
   async getAuthorBooks(userId: string) {
@@ -235,27 +549,19 @@ export class BooksService {
       },
       include: {
         chapters: {
+          include: {
+            edition: true,
+            chapterTokens: true,
+          },
           orderBy: {
             chapterNumber: 'asc',
           },
         },
         offers: {
-          include: {
-            orderItems: {
-              include: {
-                order: {
-                  include: {
-                    payment: true,
-                  },
-                },
-              },
-            },
-          },
           orderBy: {
             createdAt: 'asc',
           },
         },
-        entitlements: true,
         readingProgress: true,
       },
       orderBy: {
@@ -264,92 +570,68 @@ export class BooksService {
     });
 
     return books.map((book) => ({
-      ...book,
+      id: book.id,
+      title: book.title,
+      slug: book.slug,
+      synopsis: book.synopsis,
+      coverImageUrl: book.coverImageUrl,
+      collection:
+        book.collectionMintAddress && book.collectionMetadataAddress
+          ? {
+              mintAddress: book.collectionMintAddress,
+              metadataAddress: book.collectionMetadataAddress,
+              metadataUri: book.collectionMetadataUri,
+            }
+          : null,
+      status: book.status,
+      createdAt: book.createdAt,
+      updatedAt: book.updatedAt,
       chapters: book.chapters.map((chapter) => {
-        const matchingOffers = book.offers.filter((offer) => {
-          if (offer.type === OfferType.FULL_BOOK) {
-            return true;
-          }
-
-          if (
-            offer.chapterStart === null ||
-            offer.chapterEnd === null ||
-            offer.chapterStart === undefined ||
-            offer.chapterEnd === undefined
-          ) {
-            return false;
-          }
-
-          return (
-            chapter.chapterNumber >= offer.chapterStart &&
-            chapter.chapterNumber <= offer.chapterEnd
-          );
-        });
-
-        const unlocks = book.entitlements.filter((entitlement) => {
-          if (entitlement.fullBook) {
-            return true;
-          }
-
-          if (
-            entitlement.chapterStart === null ||
-            entitlement.chapterEnd === null ||
-            entitlement.chapterStart === undefined ||
-            entitlement.chapterEnd === undefined
-          ) {
-            return false;
-          }
-
-          return (
-            chapter.chapterNumber >= entitlement.chapterStart &&
-            chapter.chapterNumber <= entitlement.chapterEnd
-          );
-        }).length;
-
-        const activeReaders = book.readingProgress.filter(
-          (progress) => progress.currentChapterNumber >= chapter.chapterNumber,
-        ).length;
-
-        const revenueInKobo = matchingOffers.reduce((sum, offer) => {
-          const coveredChapterCount =
-            offer.type === OfferType.FULL_BOOK
-              ? Math.max(book.chapters.length, 1)
-              : Math.max(
-                  (offer.chapterEnd ?? chapter.chapterNumber) -
-                    (offer.chapterStart ?? chapter.chapterNumber) +
-                    1,
-                  1,
-                );
-
-          const offerRevenue = offer.orderItems.reduce(
-            (orderSum, orderItem) => {
-              if (
-                orderItem.order.status !== 'COMPLETED' &&
-                orderItem.order.payment?.status !== 'SUCCEEDED'
-              ) {
-                return orderSum;
+        const readMetrics =
+          chapter.wordCount > 0
+            ? {
+                wordCount: chapter.wordCount,
+                estimatedReadMinutes: chapter.estimatedReadMinutes,
               }
-
-              return (
-                orderSum +
-                Math.round(orderItem.amountInKobo / coveredChapterCount)
-              );
-            },
-            0,
-          );
-
-          return sum + offerRevenue;
-        }, 0);
+            : computeReadMetrics(chapter.draftFormat, chapter.draftContent);
 
         return {
-          ...chapter,
+          id: chapter.id,
+          bookId: chapter.bookId,
+          title: chapter.title,
+          slug: chapter.slug,
+          chapterNumber: chapter.chapterNumber,
+          isFree: chapter.isFree,
+          wordCount: readMetrics.wordCount,
+          estimatedReadMinutes: readMetrics.estimatedReadMinutes,
+          draftFormat: chapter.draftFormat,
+          draftContent: chapter.draftContent,
+          authorNotes: chapter.authorNotes,
           checklistItems: normalizeChecklistItems(chapter.checklistItems),
           analytics: {
-            unlocks,
-            activeReaders,
-            revenueInKobo,
-            offerMentions: matchingOffers.length,
+            unlocks: chapter.chapterTokens.length,
+            activeReaders: book.readingProgress.filter(
+              (item) => item.currentChapterNumber >= chapter.chapterNumber,
+            ).length,
+            revenueInUsdcMinor:
+              (chapter.edition?.mintedCopies ?? 0) *
+              (chapter.edition?.priceInUsdcMinor ?? 0),
+            offerMentions: chapter.edition ? 1 : 0,
+            mintedCopies: chapter.edition?.mintedCopies ?? 0,
+            maxCopies: chapter.edition?.maxCopies ?? 0,
           },
+          publishedAt: chapter.publishedAt,
+          edition: chapter.edition
+            ? {
+                id: chapter.edition.id,
+                maxCopies: chapter.edition.maxCopies,
+                mintedCopies: chapter.edition.mintedCopies,
+                priceInUsdcMinor: chapter.edition.priceInUsdcMinor,
+                sellerWalletAddress: chapter.edition.sellerWalletAddress,
+              }
+            : null,
+          createdAt: chapter.createdAt,
+          updatedAt: chapter.updatedAt,
         };
       }),
       offers: book.offers.map((offer) => ({
@@ -358,8 +640,7 @@ export class BooksService {
         type: offer.type,
         title: offer.title,
         description: offer.description,
-        priceInKobo: offer.priceInKobo,
-        currency: offer.currency,
+        priceInUsdcMinor: offer.priceInUsdcMinor,
         chapterStart: offer.chapterStart,
         chapterEnd: offer.chapterEnd,
         isActive: offer.isActive,
@@ -370,24 +651,23 @@ export class BooksService {
   }
 
   async createBook(user: SessionUser, dto: UpsertBookDto) {
-    const slug = slugify(dto.title);
-
-    await this.prisma.user.update({
-      where: { id: user.id },
-      data: {
-        roles: user.roles.includes(Role.AUTHOR)
-          ? user.roles
-          : [...user.roles, Role.AUTHOR],
-      },
-    });
-
     return this.prisma.book.create({
       data: {
         title: dto.title,
-        slug,
+        slug: slugify(dto.title),
         synopsis: dto.synopsis,
         coverImageUrl: dto.coverImageUrl,
         authorId: user.id,
+      },
+      include: {
+        chapters: {
+          include: {
+            edition: true,
+            chapterTokens: true,
+          },
+        },
+        offers: true,
+        readingProgress: true,
       },
     });
   }
@@ -407,16 +687,6 @@ export class BooksService {
   }
 
   async markBookComplete(userId: string, bookId: string) {
-    const chapters = await this.prisma.chapter.findMany({
-      where: { bookId },
-    });
-
-    if (chapters.some((chapter) => !chapter.publishedAt)) {
-      throw new BadRequestException(
-        'Publish every chapter before completing the book.',
-      );
-    }
-
     await this.ensureBookOwner(userId, bookId);
 
     return this.prisma.book.update({
@@ -433,80 +703,60 @@ export class BooksService {
     dto: UpsertOfferDto,
     offerId?: string,
   ) {
-    const book = await this.ensureBookOwner(userId, bookId);
+    await this.ensureBookOwner(userId, bookId);
 
-    if (
-      dto.type === OfferType.FULL_BOOK &&
-      book.status !== BookStatus.COMPLETED
-    ) {
+    if (dto.type !== OfferType.SINGLE_CHAPTER) {
       throw new BadRequestException(
-        'Full-book offers are only allowed for completed books.',
+        'Lesenpad currently supports chapter-level blockchain editions only.',
       );
     }
 
-    if (
-      dto.type !== OfferType.FULL_BOOK &&
-      (!dto.chapterStart || !dto.chapterEnd)
-    ) {
-      throw new BadRequestException(
-        'Chapter-based offers require a chapter range.',
-      );
-    }
-
-    if (
-      dto.type !== OfferType.FULL_BOOK &&
-      dto.chapterStart &&
-      dto.chapterEnd &&
-      dto.chapterStart > dto.chapterEnd
-    ) {
-      throw new BadRequestException(
-        'Chapter start cannot be greater than chapter end.',
-      );
-    }
-
-    const chapterNumbers = bookId
-      ? await this.prisma.chapter.findMany({
-          where: { bookId },
-          select: { chapterNumber: true },
+    const existing = offerId
+      ? await this.prisma.offer.findUnique({
+          where: { id: offerId },
         })
-      : [];
-    const availableChapterNumbers = new Set(
-      chapterNumbers.map((chapter) => chapter.chapterNumber),
-    );
+      : null;
 
-    if (
-      dto.type !== OfferType.FULL_BOOK &&
-      dto.chapterStart &&
-      dto.chapterEnd &&
-      (!availableChapterNumbers.has(dto.chapterStart) ||
-        !availableChapterNumbers.has(dto.chapterEnd))
-    ) {
+    if (offerId && !existing) {
+      throw new NotFoundException('Offer not found.');
+    }
+
+    const chapter = await this.prisma.chapter.findFirst({
+      where: {
+        bookId,
+        chapterNumber: dto.chapterStart,
+      },
+    });
+
+    if (!chapter) {
       throw new BadRequestException(
-        'Offer chapter range must match existing chapters.',
+        'Single chapter offers must point to a valid chapter.',
       );
     }
 
-    const data = {
-      type: dto.type,
-      title: dto.title,
-      description: dto.description,
-      priceInKobo: dto.priceInKobo,
-      chapterStart: dto.chapterStart,
-      chapterEnd: dto.chapterEnd,
-      isActive: dto.isActive ?? true,
-    };
-
-    if (offerId) {
-      return this.prisma.offer.update({
-        where: { id: offerId },
-        data,
-      });
-    }
-
-    return this.prisma.offer.create({
-      data: {
-        ...data,
+    return this.prisma.offer.upsert({
+      where: {
+        id: offerId ?? 'missing-offer-id',
+      },
+      update: {
+        title: dto.title,
+        description: dto.description,
+        priceInUsdcMinor: dto.priceInUsdcMinor,
+        chapterStart: dto.chapterStart,
+        chapterEnd: dto.chapterEnd,
+        chapterId: chapter.id,
+        isActive: dto.isActive ?? true,
+      },
+      create: {
         bookId,
+        chapterId: chapter.id,
+        type: OfferType.SINGLE_CHAPTER,
+        title: dto.title,
+        description: dto.description,
+        priceInUsdcMinor: dto.priceInUsdcMinor,
+        chapterStart: dto.chapterStart,
+        chapterEnd: dto.chapterEnd,
+        isActive: dto.isActive ?? true,
       },
     });
   }
@@ -514,6 +764,7 @@ export class BooksService {
   async createChapter(userId: string, bookId: string, dto: UpsertChapterDto) {
     await this.ensureBookOwner(userId, bookId);
     await this.ensureUniqueChapterNumber(bookId, dto.chapterNumber);
+    const readMetrics = buildReadMetricsData(dto.draftFormat, dto.draftContent);
 
     return this.prisma.chapter.create({
       data: {
@@ -521,9 +772,11 @@ export class BooksService {
         title: dto.title,
         slug: slugify(dto.title),
         chapterNumber: dto.chapterNumber,
+        isFree: dto.isFree ?? false,
         draftFormat: dto.draftFormat,
         draftContent: dto.draftContent,
-        isFree: dto.isFree ?? false,
+        wordCount: readMetrics.wordCount,
+        estimatedReadMinutes: readMetrics.estimatedReadMinutes,
         authorNotes: dto.authorNotes?.trim() || null,
         checklistItems: normalizeChecklistItems(dto.checklistItems),
       },
@@ -538,6 +791,7 @@ export class BooksService {
   ) {
     await this.ensureBookOwner(userId, bookId);
     await this.ensureUniqueChapterNumber(bookId, dto.chapterNumber, chapterId);
+    const readMetrics = buildReadMetricsData(dto.draftFormat, dto.draftContent);
 
     return this.prisma.chapter.update({
       where: { id: chapterId },
@@ -547,6 +801,8 @@ export class BooksService {
         chapterNumber: dto.chapterNumber,
         draftFormat: dto.draftFormat,
         draftContent: dto.draftContent,
+        wordCount: readMetrics.wordCount,
+        estimatedReadMinutes: readMetrics.estimatedReadMinutes,
         isFree: dto.isFree ?? false,
         authorNotes: dto.authorNotes?.trim() || null,
         checklistItems: normalizeChecklistItems(dto.checklistItems),
@@ -577,6 +833,11 @@ export class BooksService {
       },
     });
 
+    const readMetrics = buildReadMetricsData(
+      chapter.draftFormat,
+      chapter.draftContent,
+    );
+
     const duplicatedChapter = await this.prisma.$transaction([
       ...chaptersToShift.map((item) =>
         this.prisma.chapter.update({
@@ -595,6 +856,8 @@ export class BooksService {
           isFree: chapter.isFree,
           draftFormat: chapter.draftFormat,
           draftContent: chapter.draftContent,
+          wordCount: readMetrics.wordCount,
+          estimatedReadMinutes: readMetrics.estimatedReadMinutes,
           authorNotes: chapter.authorNotes,
           checklistItems: normalizeChecklistItems(chapter.checklistItems),
         },
@@ -643,40 +906,373 @@ export class BooksService {
     });
   }
 
-  async publishChapter(userId: string, bookId: string, chapterId: string) {
+  private async buildEncryptedChapterPackage(chapter: {
+    id: string;
+    title: string;
+    chapterNumber: number;
+    draftFormat: string;
+    draftContent: string;
+    book: { title: string; slug: string };
+  }) {
+    const renderedHtml = renderPublishedHtml(
+      chapter.draftFormat as never,
+      chapter.draftContent,
+    );
+    const readMetrics = computeReadMetricsFromHtml(renderedHtml);
+    const metadata = {
+      chapterId: chapter.id,
+      chapterTitle: chapter.title,
+      chapterNumber: chapter.chapterNumber,
+      bookTitle: chapter.book.title,
+      bookSlug: chapter.book.slug,
+      wordCount: readMetrics.wordCount,
+      estimatedReadMinutes: readMetrics.estimatedReadMinutes,
+    };
+    const contentKey = this.vaultService.randomKey();
+    const packagePayload = JSON.stringify({
+      metadata,
+      renderedHtml,
+    });
+    const encryptedBuffer = this.vaultService.encryptBuffer(
+      Buffer.from(packagePayload, 'utf8'),
+      contentKey,
+    );
+    const encryptedContentKey = this.vaultService.encryptString(
+      contentKey.toString('base64'),
+    );
+    const plaintextHash = this.vaultService.hashString(renderedHtml);
+    const ipfsPayload = JSON.stringify({
+      cipherSpec: encryptedBuffer.cipherSpec,
+      payload: encryptedBuffer.payload,
+      metadata,
+      plaintextHash,
+    });
+    const ipfsUpload = await this.ipfsService.uploadEncryptedPackage(
+      ipfsPayload,
+      `${chapter.book.slug}-chapter-${chapter.chapterNumber}-encrypted`,
+    );
+
+    return {
+      renderedHtml,
+      encryptedPayload: encryptedBuffer.payload,
+      encryptedContentKey,
+      cipherSpec: encryptedBuffer.cipherSpec,
+      plaintextHash,
+      wordCount: readMetrics.wordCount,
+      estimatedReadMinutes: readMetrics.estimatedReadMinutes,
+      ipfsCid: ipfsUpload.cid,
+      ipfsUri: ipfsUpload.uri,
+      storageRootHash: null,
+      storageRetrievalUrl: ipfsUpload.gatewayUrl,
+      storageTxHash: null,
+      packageMetadata: metadata,
+    };
+  }
+
+  async publishChapter(
+    userId: string,
+    bookId: string,
+    chapterId: string,
+    dto: PublishChapterDto,
+  ) {
     await this.ensureBookOwner(userId, bookId);
     const chapter = await this.prisma.chapter.findUnique({
       where: { id: chapterId },
+      include: {
+        book: true,
+        edition: true,
+      },
     });
 
     if (!chapter) {
       throw new NotFoundException('Chapter not found.');
     }
 
-    const publishedRenderedHtml = renderPublishedHtml(
-      chapter.draftFormat,
-      chapter.draftContent,
+    if (!dto.isFree) {
+      if (!dto.priceInUsdcMinor || dto.priceInUsdcMinor < 1) {
+        throw new BadRequestException(
+          'Paid chapters must include a USDC price.',
+        );
+      }
+
+      if (!dto.maxCopies || dto.maxCopies < 1) {
+        throw new BadRequestException(
+          'Paid chapters must include a maximum number of copies.',
+        );
+      }
+    }
+
+    if (
+      chapter.edition &&
+      dto.maxCopies &&
+      dto.maxCopies !== chapter.edition.maxCopies
+    ) {
+      throw new BadRequestException(
+        'Edition size cannot be changed after a chapter has been minted.',
+      );
+    }
+
+    const sellerWallet = await this.getDefaultWallet(
+      userId,
+      dto.sellerWalletId,
     );
+    const bookCollection = !dto.isFree
+      ? await this.ensureBookCollection(chapter.bookId)
+      : null;
+    const encrypted = await this.buildEncryptedChapterPackage(chapter);
+    const nextRevision = chapter.publishedRevision + 1;
+    const publishedRevisionHash = this.vaultService.hashString(
+      `${chapter.id}:${nextRevision}:${encrypted.plaintextHash}`,
+    );
+    const metadataUpload = !dto.isFree
+      ? await this.ipfsService.uploadJson(
+          `${chapter.book.slug}-chapter-${chapter.chapterNumber}-metadata`,
+          {
+            name: `${chapter.book.title} · Chapter ${chapter.chapterNumber}: ${chapter.title}`,
+            symbol: 'LSPAD',
+            description: `${chapter.title} is a capped Lesenpad chapter edition for ${chapter.book.title}.`,
+            image: chapter.book.coverImageUrl ?? undefined,
+            external_url: encrypted.ipfsUri,
+            properties: {
+              app: 'Lesenpad',
+              network: this.solanaService.getNetwork(),
+              encryptedContentCid: encrypted.ipfsCid,
+              encryptedContentProvider: 'IPFS',
+              encryptedContentUrl:
+                encrypted.storageRetrievalUrl ?? encrypted.ipfsUri,
+              plaintextHash: encrypted.plaintextHash,
+              bookSlug: chapter.book.slug,
+              chapterNumber: chapter.chapterNumber,
+              sourceFormat: chapter.draftFormat,
+              bookCollectionMintAddress:
+                bookCollection?.collectionMintAddress ?? null,
+            },
+          },
+        )
+      : null;
+    let editionAsset = null;
 
-    await this.prisma.chapter.update({
-      where: { id: chapterId },
-      data: {
-        publishedAt: new Date(),
-        publishedFormat: chapter.draftFormat,
-        publishedContent: chapter.draftContent,
-        publishedRenderedHtml,
-      },
-    });
+    if (chapter.edition) {
+      if (
+        bookCollection &&
+        chapter.edition.collectionMintAddress &&
+        chapter.edition.collectionMintAddress !==
+          bookCollection.collectionMintAddress
+      ) {
+        throw new BadRequestException(
+          'This chapter edition is already linked to a different book collection.',
+        );
+      }
 
-    await this.prisma.book.update({
-      where: { id: bookId },
-      data: {
-        status: BookStatus.PUBLISHED,
-      },
+      if (bookCollection && !chapter.edition.collectionMintAddress) {
+        const collectionVerification =
+          await this.solanaService.attachNftToCollection({
+            nftMetadataAddress: chapter.edition.metadataAddress,
+            collectionMintAddress: bookCollection.collectionMintAddress,
+          });
+
+        editionAsset = {
+          masterMintAddress: chapter.edition.masterMintAddress,
+          metadataAddress: chapter.edition.metadataAddress,
+          masterEditionAddress: chapter.edition.masterEditionAddress ?? null,
+          metadataUri:
+            chapter.edition.metadataUri ?? metadataUpload?.uri ?? null,
+          collectionMintAddress: bookCollection.collectionMintAddress,
+          signature: collectionVerification.signature,
+          confirmationSlot: collectionVerification.confirmationSlot,
+          blockTime: collectionVerification.blockTime,
+        };
+      } else {
+        editionAsset = {
+          masterMintAddress: chapter.edition.masterMintAddress,
+          metadataAddress: chapter.edition.metadataAddress,
+          masterEditionAddress: chapter.edition.masterEditionAddress ?? null,
+          metadataUri:
+            chapter.edition.metadataUri ?? metadataUpload?.uri ?? null,
+          collectionMintAddress: chapter.edition.collectionMintAddress ?? null,
+          signature: `metadata-existing-${chapter.edition.masterMintAddress}-${nextRevision}`,
+          confirmationSlot: null,
+          blockTime: null,
+        };
+      }
+    } else if (!dto.isFree && metadataUpload) {
+      editionAsset = await this.solanaService.createChapterEditionAsset({
+        name: `${chapter.book.title} Ch. ${chapter.chapterNumber}`,
+        uri: metadataUpload.uri,
+        maxCopies: dto.maxCopies!,
+        collectionMintAddress: bookCollection?.collectionMintAddress,
+      });
+    }
+
+    await this.prisma.$transaction(async (tx) => {
+      await tx.chapter.update({
+        where: { id: chapterId },
+        data: {
+          isFree: dto.isFree,
+          publishedAt: new Date(),
+          publishedRevision: nextRevision,
+          publishedFormat: chapter.draftFormat,
+          publishedContent: chapter.draftContent,
+          publishedRenderedHtml: encrypted.renderedHtml,
+          wordCount: encrypted.wordCount,
+          estimatedReadMinutes: encrypted.estimatedReadMinutes,
+        },
+      });
+
+      await tx.encryptedChapterBlob.create({
+        data: {
+          chapterId,
+          revision: nextRevision,
+          storageProvider: 'IPFS',
+          storageRootHash: encrypted.storageRootHash,
+          storageRetrievalUrl: encrypted.storageRetrievalUrl,
+          ipfsCid: encrypted.ipfsCid,
+          encryptedContentKey: encrypted.encryptedContentKey,
+          encryptedPayloadBase64: encrypted.encryptedPayload,
+          cipherSpec: encrypted.cipherSpec,
+          plaintextHash: encrypted.plaintextHash,
+          metadataJson: {
+            sellerWalletAddress: sellerWallet.address,
+            network: this.solanaService.getNetwork(),
+            ipfsUri: encrypted.ipfsUri,
+            storageProvider: 'IPFS',
+            bookCollectionMintAddress:
+              bookCollection?.collectionMintAddress ?? null,
+          },
+        },
+      });
+
+      if (dto.isFree) {
+        await tx.chapterEdition.deleteMany({
+          where: {
+            chapterId,
+            mintedCopies: 0,
+          },
+        });
+        await tx.offer.deleteMany({
+          where: {
+            chapterId,
+            type: OfferType.SINGLE_CHAPTER,
+          },
+        });
+      } else {
+        if (!editionAsset || !metadataUpload) {
+          throw new BadRequestException(
+            'Paid chapter publishing requires onchain edition metadata.',
+          );
+        }
+
+        await tx.chapterEdition.upsert({
+          where: {
+            chapterId,
+          },
+          update: {
+            metadataAddress: editionAsset.metadataAddress,
+            masterEditionAddress: editionAsset.masterEditionAddress,
+            metadataProvider: 'IPFS',
+            metadataCid: metadataUpload.cid,
+            metadataUri: editionAsset.metadataUri ?? metadataUpload.uri,
+            collectionMintAddress: editionAsset.collectionMintAddress,
+            priceInUsdcMinor: dto.priceInUsdcMinor!,
+            sellerWalletAddress: sellerWallet.address,
+            maxCopies: chapter.edition?.maxCopies ?? dto.maxCopies!,
+            ipfsCid: encrypted.ipfsCid,
+            publishedRevisionHash,
+            isActive: true,
+          },
+          create: {
+            chapterId,
+            masterMintAddress: editionAsset.masterMintAddress,
+            metadataAddress: editionAsset.metadataAddress,
+            masterEditionAddress: editionAsset.masterEditionAddress,
+            metadataProvider: 'IPFS',
+            metadataCid: metadataUpload.cid,
+            metadataUri: editionAsset.metadataUri ?? metadataUpload.uri,
+            collectionMintAddress: editionAsset.collectionMintAddress,
+            maxCopies: dto.maxCopies!,
+            priceInUsdcMinor: dto.priceInUsdcMinor!,
+            sellerWalletAddress: sellerWallet.address,
+            ipfsCid: encrypted.ipfsCid,
+            publishedRevisionHash,
+          },
+        });
+
+        await tx.offer.upsert({
+          where: {
+            chapterId,
+          },
+          update: {
+            title: `Chapter ${chapter.chapterNumber}`,
+            description: `${chapter.title} · limited onchain edition`,
+            type: OfferType.SINGLE_CHAPTER,
+            priceInUsdcMinor: dto.priceInUsdcMinor!,
+            currency: 'USDC',
+            chapterStart: chapter.chapterNumber,
+            chapterEnd: chapter.chapterNumber,
+            isActive: true,
+          },
+          create: {
+            bookId,
+            chapterId,
+            type: OfferType.SINGLE_CHAPTER,
+            title: `Chapter ${chapter.chapterNumber}`,
+            description: `${chapter.title} · limited onchain edition`,
+            priceInUsdcMinor: dto.priceInUsdcMinor!,
+            currency: 'USDC',
+            chapterStart: chapter.chapterNumber,
+            chapterEnd: chapter.chapterNumber,
+            isActive: true,
+          },
+        });
+      }
+
+      await tx.book.update({
+        where: { id: bookId },
+        data: {
+          status:
+            chapter.book.status === BookStatus.COMPLETED
+              ? BookStatus.COMPLETED
+              : BookStatus.PUBLISHED,
+        },
+      });
+
+      await tx.onchainTransaction.create({
+        data: {
+          signature:
+            editionAsset?.signature ??
+            `free-publish-${chapterId}-${nextRevision}`,
+          network: this.solanaService.getNetwork(),
+          txType: dto.isFree ? 'METADATA_CREATE' : 'MASTER_EDITION_CREATE',
+          status: 'CONFIRMED',
+          slot: editionAsset?.confirmationSlot ?? undefined,
+          blockTime: editionAsset?.blockTime ?? undefined,
+          confirmationCommitment:
+            this.solanaService.getConfirmationCommitment(),
+          metadataJson: {
+            metadataUri: metadataUpload?.uri,
+            metadataCid: metadataUpload?.cid,
+            encryptedContentCid: encrypted.ipfsCid,
+            encryptedContentProvider: 'IPFS',
+            encryptedContentUrl:
+              encrypted.storageRetrievalUrl ?? encrypted.ipfsUri,
+            masterMintAddress: editionAsset?.masterMintAddress,
+            masterEditionAddress: editionAsset?.masterEditionAddress,
+            collectionMintAddress: editionAsset?.collectionMintAddress,
+            collectionMetadataUri: bookCollection?.collectionMetadataUri,
+          },
+          userId,
+          bookId,
+          chapterId,
+        },
+      });
     });
 
     return this.prisma.chapter.findUnique({
       where: { id: chapterId },
+      include: {
+        edition: true,
+        chapterTokens: true,
+      },
     });
   }
 
@@ -685,37 +1281,18 @@ export class BooksService {
 
     const chapter = await this.prisma.chapter.findUnique({
       where: { id: chapterId },
+      include: {
+        edition: true,
+      },
     });
 
     if (!chapter || chapter.bookId !== bookId) {
       throw new NotFoundException('Chapter not found.');
     }
 
-    if (chapter.publishedAt) {
+    if (chapter.publishedAt || chapter.edition) {
       throw new BadRequestException(
-        'Published chapters cannot be deleted from the studio.',
-      );
-    }
-
-    const relatedOffers = await this.prisma.offer.findFirst({
-      where: {
-        bookId,
-        type: {
-          not: OfferType.FULL_BOOK,
-        },
-        chapterStart: {
-          lte: chapter.chapterNumber,
-        },
-        chapterEnd: {
-          gte: chapter.chapterNumber,
-        },
-        isActive: true,
-      },
-    });
-
-    if (relatedOffers) {
-      throw new BadRequestException(
-        'Deactivate chapter offers touching this chapter before deleting it.',
+        'Published or tokenized chapters cannot be deleted from the studio.',
       );
     }
 
@@ -744,6 +1321,100 @@ export class BooksService {
     return { success: true };
   }
 
+  private async resolveOwnedToken(
+    chapterId: string,
+    userId?: string,
+  ): Promise<{
+    ownerWalletAddress: string | null;
+    owned: boolean;
+  }> {
+    if (!userId) {
+      return {
+        ownerWalletAddress: null,
+        owned: false,
+      };
+    }
+
+    const token = await this.prisma.chapterToken.findFirst({
+      where: {
+        chapterId,
+        ownerUserId: userId,
+      },
+      orderBy: {
+        createdAt: 'asc',
+      },
+    });
+
+    if (!token) {
+      const chapter = await this.prisma.chapter.findUnique({
+        where: {
+          id: chapterId,
+        },
+        select: {
+          chapterNumber: true,
+          bookId: true,
+        },
+      });
+      if (!chapter) {
+        return {
+          ownerWalletAddress: null,
+          owned: false,
+        };
+      }
+
+      const entitlements = await this.prisma.entitlement.findMany({
+        where: {
+          userId,
+          bookId: chapter.bookId,
+        },
+      });
+
+      const legacyUnlocked = entitlements.some((entitlement) => {
+        if (entitlement.fullBook) {
+          return true;
+        }
+
+        return (
+          entitlement.chapterStart != null &&
+          entitlement.chapterEnd != null &&
+          chapter.chapterNumber >= entitlement.chapterStart &&
+          chapter.chapterNumber <= entitlement.chapterEnd
+        );
+      });
+
+      return {
+        ownerWalletAddress: null,
+        owned: legacyUnlocked,
+      };
+    }
+
+    await this.prisma.ownershipVerificationCache.upsert({
+      where: {
+        walletAddress_chapterTokenMint: {
+          walletAddress: token.ownerWalletAddress,
+          chapterTokenMint: token.mintAddress,
+        },
+      },
+      update: {
+        verifiedOwner: true,
+        verifiedAt: new Date(),
+        expiresAt: new Date(Date.now() + 5 * 60 * 1000),
+      },
+      create: {
+        walletAddress: token.ownerWalletAddress,
+        chapterTokenMint: token.mintAddress,
+        verifiedOwner: true,
+        verifiedAt: new Date(),
+        expiresAt: new Date(Date.now() + 5 * 60 * 1000),
+      },
+    });
+
+    return {
+      ownerWalletAddress: token.ownerWalletAddress,
+      owned: true,
+    };
+  }
+
   async getReaderChapter(
     slug: string,
     chapterNumber: number,
@@ -753,6 +1424,14 @@ export class BooksService {
       where: { slug },
       include: {
         chapters: {
+          include: {
+            edition: true,
+            encryptedBlobs: {
+              orderBy: {
+                revision: 'desc',
+              },
+            },
+          },
           orderBy: {
             chapterNumber: 'asc',
           },
@@ -768,30 +1447,87 @@ export class BooksService {
       (item) => item.chapterNumber === chapterNumber,
     );
 
-    if (!chapter || !chapter.publishedAt || !chapter.publishedRenderedHtml) {
+    if (!chapter || !chapter.publishedAt) {
       throw new NotFoundException('Chapter not found.');
     }
 
-    const accessMap = await this.getBookAccessMap(book.id, userId);
-    const unlocked =
-      chapter.isFree ||
-      accessMap.has(-1) ||
-      accessMap.has(chapter.chapterNumber);
+    const ownership = await this.resolveOwnedToken(chapter.id, userId);
+    const unlocked = chapter.isFree || ownership.owned;
 
     if (!unlocked) {
       throw new ForbiddenException(
-        'Purchase this chapter or bundle to continue.',
+        'Own this chapter asset to continue reading.',
       );
     }
+
+    let renderedHtml = chapter.publishedRenderedHtml ?? '';
+
+    if (!chapter.isFree) {
+      const latestBlob = chapter.encryptedBlobs.find(
+        (item) => item.revision === chapter.publishedRevision,
+      );
+
+      if (latestBlob) {
+        try {
+          const packagePayload =
+            latestBlob.storageProvider === 'IPFS' && latestBlob.ipfsCid
+              ? getEncryptedPackagePayload(
+                  await this.ipfsService.downloadEncryptedPackage(
+                    latestBlob.ipfsCid,
+                  ),
+                  latestBlob.encryptedPayloadBase64,
+                )
+              : latestBlob.encryptedPayloadBase64;
+          const contentKey = Buffer.from(
+            this.vaultService.decryptString(latestBlob.encryptedContentKey),
+            'base64',
+          );
+          const decrypted = this.vaultService.decryptBuffer(
+            packagePayload,
+            contentKey,
+          );
+          const payload = JSON.parse(decrypted.toString('utf8')) as {
+            renderedHtml: string;
+          };
+          renderedHtml = payload.renderedHtml;
+        } catch (error) {
+          this.logger.warn(
+            `Failed to decrypt chapter blob ${latestBlob.id} for chapter ${chapter.id}; falling back to published snapshot.`,
+            error instanceof Error ? error.stack : undefined,
+          );
+        }
+      }
+    }
+
+    const readMetrics =
+      chapter.wordCount > 0
+        ? {
+            wordCount: chapter.wordCount,
+            estimatedReadMinutes: chapter.estimatedReadMinutes,
+          }
+        : computeReadMetricsFromHtml(renderedHtml);
 
     return {
       bookTitle: book.title,
       chapterTitle: chapter.title,
       chapterNumber: chapter.chapterNumber,
-      renderedHtml: chapter.publishedRenderedHtml,
+      wordCount: readMetrics.wordCount,
+      estimatedReadMinutes: readMetrics.estimatedReadMinutes,
+      renderedHtml,
       progressPercent: Math.round(
-        (chapter.chapterNumber / book.chapters.length) * 100,
+        (chapter.chapterNumber / Math.max(book.chapters.length, 1)) * 100,
       ),
+      ownership: {
+        required: !chapter.isFree,
+        owned: chapter.isFree || ownership.owned,
+        ownerWalletAddress: ownership.ownerWalletAddress,
+        editionSupply: chapter.edition
+          ? {
+              mintedCopies: chapter.edition.mintedCopies,
+              maxCopies: chapter.edition.maxCopies,
+            }
+          : null,
+      },
     };
   }
 
