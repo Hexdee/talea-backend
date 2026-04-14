@@ -1,25 +1,55 @@
-FROM node:22-alpine AS deps
-WORKDIR /app
-RUN corepack enable
-COPY package.json pnpm-lock.yaml ./
-RUN pnpm install --frozen-lockfile
+# syntax = docker/dockerfile:1
 
-FROM node:22-alpine AS builder
+# Adjust NODE_VERSION as desired
+ARG NODE_VERSION=22.21.1
+FROM node:${NODE_VERSION}-slim AS base
+
+LABEL fly_launch_runtime="NestJS/Prisma"
+
+# NestJS/Prisma app lives here
 WORKDIR /app
-RUN corepack enable
-COPY --from=deps /app/node_modules ./node_modules
+
+# Set production environment
+ENV NODE_ENV="production"
+
+# Install pnpm
+ARG PNPM_VERSION=latest
+RUN npm install -g pnpm@$PNPM_VERSION
+
+
+# Throw-away build stage to reduce size of final image
+FROM base AS build
+
+# Install packages needed to build node modules
+RUN apt-get update -qq && \
+    apt-get install --no-install-recommends -y build-essential node-gyp openssl pkg-config python-is-python3
+
+# Install node modules
+COPY package.json pnpm-lock.yaml ./
+RUN pnpm install --frozen-lockfile --prod=false
+
+# Generate Prisma Client
+COPY prisma .
+RUN npx prisma generate
+
+# Copy application code
 COPY . .
-RUN pnpm prisma generate
-RUN pnpm build
 
-FROM node:22-alpine AS runner
-WORKDIR /app
-ENV NODE_ENV=production
-RUN corepack enable
-COPY package.json pnpm-lock.yaml ./
-RUN pnpm install --prod --frozen-lockfile
-COPY --from=builder /app/dist ./dist
-COPY --from=builder /app/prisma ./prisma
-COPY --from=builder /app/node_modules/.prisma ./node_modules/.prisma
-EXPOSE 4000
-CMD ["pnpm", "start:prod"]
+# Build application
+RUN pnpm run build
+
+
+# Final stage for app image
+FROM base
+
+# Install packages needed for deployment
+RUN apt-get update -qq && \
+    apt-get install --no-install-recommends -y openssl && \
+    rm -rf /var/lib/apt/lists /var/cache/apt/archives
+
+# Copy built application
+COPY --from=build /app /app
+
+# Start the server by default, this can be overwritten at runtime
+EXPOSE 8080
+CMD [ "pnpm", "run", "start" ]

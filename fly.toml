@@ -1,17 +1,26 @@
-app = "lesenpad-backend"
-primary_region = "jnb"
+# fly.toml app configuration file generated for talea-backend on 2026-03-28T19:49:06Z
+#
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
+
+app = 'talea-backend'
+primary_region = 'iad'
 
 [build]
-  dockerfile = "Dockerfile"
 
-[env]
-  NODE_ENV = "production"
-  PORT = "4000"
+[deploy]
+  release_command = 'npx prisma migrate deploy'
 
 [http_service]
-  internal_port = 4000
+  internal_port = 8080
   force_https = true
+  auto_stop_machines = 'stop'
   auto_start_machines = true
-  auto_stop_machines = "stop"
   min_machines_running = 0
-  processes = ["app"]
+  processes = ['app']
+
+[[vm]]
+  memory = '1gb'
+  cpu_kind = 'shared'
+  cpus = 1
+  memory_mb = 1024
