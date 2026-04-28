@@ -2,6 +2,7 @@ import {
   BadRequestException,
   Inject,
   Injectable,
+  Logger,
   NotFoundException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
@@ -35,6 +36,8 @@ import {
 
 @Injectable()
 export class WalletService {
+  private readonly logger = new Logger(WalletService.name);
+
   constructor(
     private readonly prisma: PrismaService,
     private readonly configService: ConfigService,
@@ -320,6 +323,26 @@ export class WalletService {
           take: 20,
         }),
       ]);
+
+    const defaultCustodialWallet = chainWallets.find(
+      (item) =>
+        item.custodyType === 'CUSTODIAL' && item.isActive && item.isDefault,
+    );
+    if (defaultCustodialWallet) {
+      try {
+        await this.refreshDepositsForChainWallet(
+          userId,
+          defaultCustodialWallet.id,
+          defaultCustodialWallet.address,
+        );
+      } catch (error) {
+        this.logger.warn(
+          `Deposit auto-refresh skipped for user ${userId}: ${
+            error instanceof Error ? error.message : 'Unknown error'
+          }`,
+        );
+      }
+    }
 
     const chainWalletPayload = await Promise.all(
       chainWallets.map(async (item) => {

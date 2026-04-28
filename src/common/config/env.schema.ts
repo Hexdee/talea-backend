@@ -15,6 +15,9 @@ export const envSchema = z
     PORT: integerString.default('4000'),
     THROTTLE_TTL_SECONDS: integerString.default('60'),
     THROTTLE_LIMIT: integerString.default('120'),
+    RECONCILIATION_ENABLED: z.enum(['true', 'false']).default('true'),
+    RECONCILIATION_INTERVAL_SECONDS: integerString.default('300'),
+    RECONCILIATION_INITIAL_DELAY_SECONDS: integerString.default('20'),
     DATABASE_URL: z.url(),
     FRONTEND_ORIGIN: z
       .string()
