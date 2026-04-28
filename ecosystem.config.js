@@ -3,7 +3,7 @@ module.exports = {
     {
       name: 'lesenpad-backend',
       cwd: __dirname,
-      script: 'dist/main.js',
+      script: 'dist/src/main.js',
       exec_mode: 'cluster',
       instances: 2,
       autorestart: true,
