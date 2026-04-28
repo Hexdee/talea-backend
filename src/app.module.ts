@@ -10,9 +10,12 @@ import { ChainModule } from './chain/chain.module';
 import { ChaptersModule } from './chapters/chapters.module';
 import { envSchema } from './common/config/env.schema';
 import { HealthModule } from './health/health.module';
+import { LedgerModule } from './ledger/ledger.module';
 import { LibraryModule } from './library/library.module';
+import { OpsModule } from './ops/ops.module';
 import { PaymentsModule } from './payments/payments.module';
 import { PrismaModule } from './prisma/prisma.module';
+import { TransakModule } from './transak/transak.module';
 import { WalletModule } from './wallet/wallet.module';
 
 @Module({
@@ -30,6 +33,8 @@ import { WalletModule } from './wallet/wallet.module';
       ],
     }),
     ChainModule,
+    LedgerModule,
+    TransakModule,
     PrismaModule,
     AuthModule,
     HealthModule,
@@ -37,6 +42,7 @@ import { WalletModule } from './wallet/wallet.module';
     BooksModule,
     ChaptersModule,
     LibraryModule,
+    OpsModule,
     PaymentsModule,
     AnalyticsModule,
     WalletModule,

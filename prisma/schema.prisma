@@ -57,7 +57,9 @@ enum PaymentStatus {
 enum WalletTransactionType {
   SALE
   DEPOSIT
+  PURCHASE
   MINT_FEE
+  GAS_FEE
   PAYOUT_REQUEST
   PAYOUT_COMPLETED
   ADJUSTMENT
@@ -69,6 +71,7 @@ enum PayoutRequestStatus {
   APPROVED
   PAID
   REJECTED
+  DEAD_LETTER
 }
 
 enum ChainWalletCustodyType {
@@ -108,6 +111,32 @@ enum MetadataStorageProvider {
   IPFS
 }
 
+enum LedgerEntryType {
+  DEPOSIT_CREDIT
+  PURCHASE_HOLD
+  PURCHASE_DEBIT
+  PURCHASE_RELEASE
+  SALE_CREDIT
+  WITHDRAWAL_HOLD
+  WITHDRAWAL_DEBIT
+  WITHDRAWAL_RELEASE
+  GAS_FEE_DEBIT
+  ADJUSTMENT
+}
+
+enum TransakOrderType {
+  ONRAMP
+  OFFRAMP
+}
+
+enum TransakOrderStatus {
+  CREATED
+  PENDING
+  COMPLETED
+  FAILED
+  CANCELLED
+}
+
 model User {
   id                  String               @id @default(cuid())
   email               String               @unique
@@ -129,6 +158,8 @@ model User {
   chainWallets        UserChainWallet[]
   chapterTokens       ChapterToken[]
   onchainTransactions OnchainTransaction[]
+  transakOrders       TransakOrderIntent[]
+  ledgerEntries       LedgerJournal[]
 }
 
 model BlogPost {
@@ -366,6 +397,8 @@ model Wallet {
   availableBalanceInUsdcMinor Int                 @default(0)
   pendingBalanceInUsdcMinor   Int                 @default(0)
   transactions                WalletTransaction[]
+  ledgerEntries               LedgerJournal[]
+  transakOrders               TransakOrderIntent[]
   createdAt                   DateTime            @default(now())
   updatedAt                   DateTime            @updatedAt
 }
@@ -381,6 +414,26 @@ model WalletTransaction {
   createdAt         DateTime              @default(now())
 
   @@index([walletId, createdAt])
+}
+
+model LedgerJournal {
+  id                          String          @id @default(cuid())
+  userId                      String
+  user                        User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  walletId                    String
+  wallet                      Wallet          @relation(fields: [walletId], references: [id], onDelete: Cascade)
+  type                        LedgerEntryType
+  amountInUsdcMinor           Int
+  idempotencyKey              String          @unique
+  availableBalanceAfterMinor  Int
+  pendingBalanceAfterMinor    Int
+  reference                   String?
+  description                 String
+  metadataJson                Json?
+  createdAt                   DateTime        @default(now())
+
+  @@index([walletId, createdAt])
+  @@index([userId, createdAt])
 }
 
 model PayoutAccount {
@@ -409,9 +462,14 @@ model PayoutRequest {
   amountInUsdcMinor   Int
   status              PayoutRequestStatus  @default(REQUESTED)
   notes               String?
+  retryCount          Int                  @default(0)
+  lastRetryAt         DateTime?
+  deadLetterReason    String?
+  externalReference   String?
   requestedAt         DateTime             @default(now())
   processedAt         DateTime?
   onchainTransactions OnchainTransaction[]
+  transakOrderIntent  TransakOrderIntent?
 }
 
 model AnalyticsSnapshot {
@@ -544,6 +602,49 @@ model PurchaseReservation {
 
   @@unique([orderId, chapterEditionId])
   @@index([expiresAt])
+}
+
+model TransakOrderIntent {
+  id                  String              @id @default(cuid())
+  userId              String
+  user                User                @relation(fields: [userId], references: [id], onDelete: Cascade)
+  walletId            String?
+  wallet              Wallet?             @relation(fields: [walletId], references: [id], onDelete: SetNull)
+  payoutRequestId     String?             @unique
+  payoutRequest       PayoutRequest?      @relation(fields: [payoutRequestId], references: [id], onDelete: SetNull)
+  type                TransakOrderType
+  status              TransakOrderStatus  @default(CREATED)
+  partnerOrderId      String              @unique
+  externalOrderId     String?             @unique
+  fiatCurrency        String?
+  fiatAmount          String?
+  cryptoCurrency      String              @default("USDC")
+  cryptoAmount        String?
+  walletAddress       String
+  transactionHash     String?
+  retryCount          Int                 @default(0)
+  lastReconciledAt    DateTime?
+  lastError           String?
+  payloadJson         Json?
+  createdAt           DateTime            @default(now())
+  updatedAt           DateTime            @updatedAt
+
+  @@index([userId, type, status])
+  @@index([walletAddress, status])
+}
+
+model TransakWebhookEvent {
+  id                String   @id @default(cuid())
+  eventKey          String   @unique
+  externalOrderId   String?
+  partnerOrderId    String?
+  eventType         String?
+  status            String?
+  signature         String?
+  payloadJson       Json
+  processedAt       DateTime?
+  errorMessage      String?
+  createdAt         DateTime @default(now())
 }
 
 model OnchainTransaction {

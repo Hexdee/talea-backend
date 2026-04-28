@@ -47,6 +47,20 @@ Production NestJS API for Lesenpad.
    R2_ACCESS_KEY_ID=replace-with-r2-access-key-id
    R2_SECRET_ACCESS_KEY=replace-with-r2-secret-access-key
    R2_ENDPOINT=https://<accountid>.r2.cloudflarestorage.com
+   WALLET_PROVIDER=solana
+   TRANSAK_ENABLED=true
+   TRANSAK_API_KEY=replace-with-transak-api-key
+   TRANSAK_API_SECRET=replace-with-transak-api-secret
+   TRANSAK_WEBHOOK_SECRET=replace-with-transak-webhook-secret
+   TRANSAK_ENVIRONMENT=STAGING
+   TRANSAK_WIDGET_URL=https://global.transak.com
+   RISK_DAILY_PURCHASE_LIMIT_USDC_MINOR=200000000
+   RISK_DAILY_WITHDRAWAL_LIMIT_USDC_MINOR=500000000
+   RISK_PER_MINUTE_REQUEST_LIMIT=20
+   RISK_BLOCKED_WALLET_ADDRESSES=
+   EMAILS_ENABLED=true
+   RESEND_API_KEY=re_xxxxxxxxx
+   RESEND_FROM_EMAIL=Lesenpad <onboarding@resend.dev>
    CHAIN_MASTER_KEY=replace-with-a-stable-local-secret
    SOLANA_NETWORK=devnet
    SOLANA_RPC_URL=https://api.devnet.solana.com
@@ -62,7 +76,10 @@ Production NestJS API for Lesenpad.
    stable after publishing encrypted chapters, otherwise old encrypted chapter
    blobs cannot be decrypted. Public covers/editor media now upload to R2,
    and both paid encrypted chapter payloads and NFT metadata JSON now upload to
-   Pinata/IPFS.
+   Pinata/IPFS. Set `EMAILS_ENABLED=true` and a valid `RESEND_API_KEY` to send
+   transactional emails from signup/purchase/withdraw flows. Transak webhook
+   endpoint is `POST /v1/wallet/transak/webhook`, and authenticated on-ramp
+   intent creation endpoint is `POST /v1/wallet/transak/onramp-intents`.
 
 5. Generate the Prisma client:
 

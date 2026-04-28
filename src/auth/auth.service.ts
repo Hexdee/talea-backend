@@ -1,5 +1,6 @@
 import {
   BadRequestException,
+  Inject,
   Injectable,
   UnauthorizedException,
 } from '@nestjs/common';
@@ -8,11 +9,13 @@ import { AuthAccountProvider, Role } from '@prisma/client';
 import * as bcrypt from 'bcryptjs';
 import { createHash, randomBytes } from 'node:crypto';
 import type { Response } from 'express';
+import { WALLET_PROVIDER } from '../chain/wallet-provider.token';
 import type {
   AuthenticatedRequest,
   SessionUser,
 } from '../common/types/authenticated-request';
-import { SolanaService } from '../chain/solana.service';
+import type { WalletProvider } from '../chain/wallet-provider.interface';
+import { EmailsService } from '../emails/emails.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { LoginDto } from './dto/login.dto';
 import { SignupDto } from './dto/signup.dto';
@@ -34,7 +37,9 @@ export class AuthService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly configService: ConfigService,
-    private readonly solanaService: SolanaService,
+    @Inject(WALLET_PROVIDER)
+    private readonly walletProvider: WalletProvider,
+    private readonly emailsService: EmailsService,
   ) {}
 
   private getCookieName() {
@@ -121,7 +126,7 @@ export class AuthService {
 
     const passwordHash = await bcrypt.hash(dto.password, 10);
 
-    const custodialWallet = this.solanaService.createCustodialWallet();
+    const custodialWallet = this.walletProvider.createWallet();
 
     const user = await this.prisma.user.create({
       data: {
@@ -152,6 +157,10 @@ export class AuthService {
     });
 
     await this.createSession(user, response);
+    await this.emailsService.sendWelcomeEmail({
+      to: user.email,
+      displayName: user.displayName,
+    });
     return this.toSessionUser(user);
   }
 
@@ -205,7 +214,15 @@ export class AuthService {
     },
     response: Response,
   ) {
-    const custodialWallet = this.solanaService.createCustodialWallet();
+    const existingUser = await this.prisma.user.findUnique({
+      where: {
+        email: payload.email,
+      },
+      select: {
+        id: true,
+      },
+    });
+    const custodialWallet = this.walletProvider.createWallet();
 
     const user = await this.prisma.user.upsert({
       where: {
@@ -256,6 +273,12 @@ export class AuthService {
     });
 
     await this.createSession(user, response);
+    if (!existingUser) {
+      await this.emailsService.sendWelcomeEmail({
+        to: user.email,
+        displayName: user.displayName,
+      });
+    }
     return this.toSessionUser(user);
   }
 

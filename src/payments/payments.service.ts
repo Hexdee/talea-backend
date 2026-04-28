@@ -1,18 +1,25 @@
 import {
   BadRequestException,
   ForbiddenException,
+  InternalServerErrorException,
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
 import {
+  LedgerEntryType,
   OnchainTransactionStatus,
   OnchainTransactionType,
+  OrderStatus,
   PaymentStatus,
+  Prisma,
   WalletTransactionType,
 } from '@prisma/client';
 import { BooksService } from '../books/books.service';
-import { formatCurrency } from '../common/utils/currency';
+import { PriceQuoteService } from '../chain/price-quote.service';
 import { SolanaService } from '../chain/solana.service';
+import { formatCurrency } from '../common/utils/currency';
+import { EmailsService } from '../emails/emails.service';
+import { LedgerService } from '../ledger/ledger.service';
 import { PrismaService } from '../prisma/prisma.service';
 import {
   CompleteSolanaPaymentDto,
@@ -21,7 +28,7 @@ import {
 } from './dto/payment.dto';
 
 function buildReference() {
-  return `TAL-SOL-${Date.now()}-${Math.random().toString(36).slice(2, 8).toUpperCase()}`;
+  return `LSP-LEDGER-${Date.now()}-${Math.random().toString(36).slice(2, 8).toUpperCase()}`;
 }
 
 @Injectable()
@@ -30,7 +37,70 @@ export class PaymentsService {
     private readonly prisma: PrismaService,
     private readonly booksService: BooksService,
     private readonly solanaService: SolanaService,
+    private readonly priceQuoteService: PriceQuoteService,
+    private readonly ledgerService: LedgerService,
+    private readonly emailsService: EmailsService,
   ) {}
+
+  private getDailyPurchaseLimit() {
+    return Number(
+      process.env.RISK_DAILY_PURCHASE_LIMIT_USDC_MINOR ?? '200000000',
+    );
+  }
+
+  private getPerMinuteLimit() {
+    return Number(process.env.RISK_PER_MINUTE_REQUEST_LIMIT ?? '20');
+  }
+
+  private blockedWalletSet() {
+    return new Set(
+      (process.env.RISK_BLOCKED_WALLET_ADDRESSES ?? '')
+        .split(',')
+        .map((item) => item.trim())
+        .filter((item) => Boolean(item)),
+    );
+  }
+
+  private async enforceVelocityAndCaps(
+    userId: string,
+    amountInUsdcMinor: number,
+  ) {
+    const oneMinuteAgo = new Date(Date.now() - 60 * 1000);
+    const minuteCount = await this.prisma.ledgerJournal.count({
+      where: {
+        userId,
+        createdAt: {
+          gte: oneMinuteAgo,
+        },
+      },
+    });
+    if (minuteCount >= this.getPerMinuteLimit()) {
+      throw new BadRequestException(
+        'Too many wallet operations in a short window. Try again shortly.',
+      );
+    }
+
+    const dayStart = new Date();
+    dayStart.setHours(0, 0, 0, 0);
+    const aggregate = await this.prisma.ledgerJournal.aggregate({
+      where: {
+        userId,
+        type: LedgerEntryType.PURCHASE_DEBIT,
+        createdAt: {
+          gte: dayStart,
+        },
+      },
+      _sum: {
+        amountInUsdcMinor: true,
+      },
+    });
+    const spentToday = Math.abs(aggregate._sum.amountInUsdcMinor ?? 0);
+    if (spentToday + amountInUsdcMinor > this.getDailyPurchaseLimit()) {
+      throw new BadRequestException(
+        'Daily purchase limit reached. Try again tomorrow or contact support.',
+      );
+    }
+  }
 
   private async buildPurchaseContext(userId: string, dto: QuotePurchaseDto) {
     const book = await this.prisma.book.findUnique({
@@ -94,9 +164,7 @@ export class PaymentsService {
     );
 
     if (purchasableChapters.length === 0) {
-      throw new BadRequestException(
-        'Only paid chapters require onchain purchase.',
-      );
+      throw new BadRequestException('Only paid chapters require purchase.');
     }
 
     const unavailableChapter = purchasableChapters.find(
@@ -144,18 +212,38 @@ export class PaymentsService {
     };
   }
 
+  private async estimateGasFeeInUsdcMinor(chapterCount: number) {
+    const estimatedLamportsPerMint = Number(
+      process.env.PURCHASE_GAS_ESTIMATE_LAMPORTS_PER_CHAPTER ?? '1500000',
+    );
+    const quote =
+      await this.priceQuoteService.lamportsToUsdcMinorWithLockedQuote(
+        Math.max(0, chapterCount * estimatedLamportsPerMint),
+      );
+
+    return quote.feeInUsdcMinor;
+  }
+
   async quotePurchase(userId: string, dto: QuotePurchaseDto) {
     const context = await this.buildPurchaseContext(userId, dto);
     const totalAmountInUsdcMinor = context.items.reduce(
       (sum, item) => sum + item.amountInUsdcMinor,
       0,
     );
+    const estimatedGasFeeInUsdcMinor = await this.estimateGasFeeInUsdcMinor(
+      context.items.length,
+    );
 
     return {
       slug: context.book.slug,
       title: context.book.title,
       totalAmountInUsdcMinor,
+      estimatedGasFeeInUsdcMinor,
       formattedTotal: formatCurrency(totalAmountInUsdcMinor, 'USDC'),
+      formattedEstimatedGasFee: formatCurrency(
+        estimatedGasFeeInUsdcMinor,
+        'USDC',
+      ),
       items: context.items.map((item) => ({
         chapterNumber: item.chapterNumber,
         title: item.title,
@@ -179,6 +267,9 @@ export class PaymentsService {
     const totalAmountInUsdcMinor = context.items.reduce(
       (sum, item) => sum + item.amountInUsdcMinor,
       0,
+    );
+    const estimatedGasFeeInUsdcMinor = await this.estimateGasFeeInUsdcMinor(
+      context.items.length,
     );
     const recipientWalletAddress =
       context.items[0]?.sellerWalletAddress ?? null;
@@ -210,10 +301,11 @@ export class PaymentsService {
         orderId: order.id,
         amountInUsdcMinor: totalAmountInUsdcMinor,
         currency: 'USDC',
-        provider: 'SOLANA_USDC',
+        provider: 'LEDGER_USDC',
         providerPayload: {
           stage: 'reserved',
-          mode: 'custodial-devnet-usdc',
+          mode: 'ledger-first',
+          estimatedGasFeeInUsdcMinor,
         },
       },
     });
@@ -232,7 +324,12 @@ export class PaymentsService {
       status: payment.status,
       network: this.solanaService.getNetwork(),
       totalAmountInUsdcMinor,
+      estimatedGasFeeInUsdcMinor,
       formattedAmount: formatCurrency(totalAmountInUsdcMinor, 'USDC'),
+      formattedEstimatedGasFee: formatCurrency(
+        estimatedGasFeeInUsdcMinor,
+        'USDC',
+      ),
       itemCount: context.items.length,
     };
   }
@@ -247,9 +344,14 @@ export class PaymentsService {
       include: {
         order: {
           include: {
+            user: true,
             items: {
               include: {
-                offer: true,
+                offer: {
+                  include: {
+                    book: true,
+                  },
+                },
                 chapter: true,
                 chapterEdition: true,
               },
@@ -268,10 +370,40 @@ export class PaymentsService {
       throw new ForbiddenException('You cannot complete this payment.');
     }
 
+    const firstPurchasedChapterNumber =
+      payment.order.items
+        .map((item) => item.chapter?.chapterNumber ?? Number.MAX_SAFE_INTEGER)
+        .sort((left, right) => left - right)[0] ?? 1;
+
+    if (payment.status === PaymentStatus.SUCCEEDED) {
+      const payload =
+        payment.providerPayload &&
+        typeof payment.providerPayload === 'object' &&
+        !Array.isArray(payment.providerPayload)
+          ? (payment.providerPayload as Record<string, unknown>)
+          : {};
+      const gasFeeInUsdcMinor =
+        typeof payload.totalGasFeeInUsdcMinor === 'number'
+          ? payload.totalGasFeeInUsdcMinor
+          : undefined;
+
+      return {
+        reference,
+        status: 'SUCCEEDED',
+        network: this.solanaService.getNetwork(),
+        chainTxSignature: payment.chainTxSignature ?? 'N/A',
+        formattedAmount: formatCurrency(payment.amountInUsdcMinor, 'USDC'),
+        firstPurchasedChapterNumber,
+        gasFeeInUsdcMinor,
+        formattedGasFee:
+          typeof gasFeeInUsdcMinor === 'number'
+            ? formatCurrency(gasFeeInUsdcMinor, 'USDC')
+            : undefined,
+      };
+    }
+
     if (payment.status !== PaymentStatus.PENDING) {
-      throw new BadRequestException(
-        'Only pending Solana payments can be completed.',
-      );
+      throw new BadRequestException('This payment is no longer pending.');
     }
 
     if (
@@ -280,7 +412,7 @@ export class PaymentsService {
       )
     ) {
       throw new BadRequestException(
-        'This reservation expired. Create a new Solana payment intent.',
+        'This reservation expired. Create a new payment intent.',
       );
     }
 
@@ -288,27 +420,139 @@ export class PaymentsService {
       userId,
       dto.ownershipWalletId,
     );
-
-    if (ownershipWallet.custodyType !== 'CUSTODIAL') {
+    if (this.blockedWalletSet().has(ownershipWallet.address)) {
       throw new BadRequestException(
-        'Checkout is custodial-only for v1. Select your Lesenpad custodial wallet.',
+        'Risk policy blocked this wallet from checkout. Contact support.',
       );
     }
+    await this.enforceVelocityAndCaps(userId, payment.amountInUsdcMinor);
 
-    if (!ownershipWallet.encryptedPrivateKey) {
-      throw new BadRequestException(
-        'The selected custodial wallet cannot sign payments.',
-      );
-    }
+    const estimatedGasFeeInUsdcMinor = await this.estimateGasFeeInUsdcMinor(
+      payment.order.items.length,
+    );
 
-    const paymentTransfer =
-      await this.solanaService.transferUsdcFromCustodialToTreasury({
-        encryptedPrivateKey: ownershipWallet.encryptedPrivateKey,
-        amountInUsdcMinor: payment.amountInUsdcMinor,
+    const reservedCopies = await this.prisma.$transaction(async (tx) => {
+      const currentPayload =
+        payment.providerPayload &&
+        typeof payment.providerPayload === 'object' &&
+        !Array.isArray(payment.providerPayload)
+          ? (payment.providerPayload as Record<string, unknown>)
+          : {};
+      const lock = await tx.payment.updateMany({
+        where: {
+          id: payment.id,
+          status: PaymentStatus.PENDING,
+          OR: [
+            {
+              providerPayload: {
+                equals: Prisma.AnyNull,
+              },
+            },
+            {
+              providerPayload: {
+                path: ['stage'],
+                equals: 'reserved',
+              },
+            },
+          ],
+        },
+        data: {
+          providerPayload: {
+            ...currentPayload,
+            stage: 'processing',
+            processingStartedAt: new Date().toISOString(),
+          },
+        },
       });
+
+      if (lock.count !== 1) {
+        throw new BadRequestException(
+          'This payment is already being processed. Refresh purchase history.',
+        );
+      }
+
+      const buyerWallet = await tx.wallet.upsert({
+        where: {
+          userId,
+        },
+        update: {},
+        create: {
+          userId,
+        },
+      });
+
+      const requiredAmount =
+        payment.amountInUsdcMinor + estimatedGasFeeInUsdcMinor;
+      if (buyerWallet.availableBalanceInUsdcMinor < requiredAmount) {
+        throw new BadRequestException({
+          code: 'INSUFFICIENT_BALANCE',
+          message:
+            'Insufficient wallet balance for purchase + estimated sponsored gas. Top up and retry.',
+          requiredAmountInUsdcMinor: requiredAmount,
+          availableAmountInUsdcMinor: buyerWallet.availableBalanceInUsdcMinor,
+        });
+      }
+
+      await this.ledgerService.postEntry(
+        {
+          userId,
+          idempotencyKey: `purchase:hold:${payment.id}`,
+          type: LedgerEntryType.PURCHASE_HOLD,
+          amountInUsdcMinor: -payment.amountInUsdcMinor,
+          availableDeltaInUsdcMinor: -payment.amountInUsdcMinor,
+          pendingDeltaInUsdcMinor: payment.amountInUsdcMinor,
+          description: `Funds held for chapter purchase ${payment.reference}`,
+          reference: payment.reference,
+          mirrorWalletTransactionType: WalletTransactionType.PURCHASE,
+        },
+        tx,
+      );
+
+      const reserved: Array<{
+        itemId: string;
+        chapterEditionId: string;
+        serialNumber: number;
+      }> = [];
+
+      for (const item of payment.order.items) {
+        if (!item.chapterEdition) {
+          throw new BadRequestException(
+            'Order item is missing chapter edition metadata.',
+          );
+        }
+
+        const claimed = await tx.$queryRaw<Array<{ mintedCopies: number }>>`
+          UPDATE "ChapterEdition"
+          SET "mintedCopies" = "mintedCopies" + 1
+          WHERE "id" = ${item.chapterEdition.id}
+            AND "mintedCopies" < "maxCopies"
+          RETURNING "mintedCopies";
+        `;
+
+        if (claimed.length === 0) {
+          throw new BadRequestException(
+            `Chapter ${item.chapter?.chapterNumber ?? '?'} is sold out.`,
+          );
+        }
+
+        reserved.push({
+          itemId: item.id,
+          chapterEditionId: item.chapterEdition.id,
+          serialNumber: claimed[0].mintedCopies,
+        });
+      }
+
+      return reserved;
+    });
+
+    const reservedByItemId = new Map(
+      reservedCopies.map((entry) => [entry.itemId, entry]),
+    );
 
     const mintedAssets: Array<{
       itemId: string;
+      chapterEditionId: string;
+      chapterNumber: number;
       mintAddress: string;
       tokenAccountAddress: string;
       editionAddress: string;
@@ -317,66 +561,99 @@ export class PaymentsService {
       confirmationSlot: number | null;
       blockTime: Date | null;
       serialNumber: number;
+      feeInLamports: number;
     }> = [];
+    let mintFailure: unknown = null;
 
     for (const item of payment.order.items) {
-      if (!item.chapter || !item.chapterEdition) {
-        throw new BadRequestException(
-          'Order item is missing chapter metadata.',
-        );
+      try {
+        if (!item.chapter || !item.chapterEdition) {
+          throw new BadRequestException(
+            'Order item is missing chapter metadata.',
+          );
+        }
+
+        const reservedCopy = reservedByItemId.get(item.id);
+        if (!reservedCopy) {
+          throw new BadRequestException(
+            `Reserved chapter copy not found for Chapter ${item.chapter.chapterNumber}.`,
+          );
+        }
+
+        const mintedAsset = await this.solanaService.mintChapterAsset({
+          masterMintAddress: item.chapterEdition.masterMintAddress,
+          destinationWalletAddress: ownershipWallet.address,
+          editionNumber: reservedCopy.serialNumber,
+          collectionMintAddress: item.chapterEdition.collectionMintAddress,
+        });
+
+        mintedAssets.push({
+          itemId: item.id,
+          chapterEditionId: item.chapterEdition.id,
+          chapterNumber: item.chapter.chapterNumber,
+          ...mintedAsset,
+          serialNumber: reservedCopy.serialNumber,
+        });
+      } catch (error) {
+        mintFailure = error;
+        break;
       }
-
-      const latestEdition = await this.prisma.chapterEdition.findUniqueOrThrow({
-        where: {
-          id: item.chapterEdition.id,
-        },
-      });
-
-      if (latestEdition.mintedCopies >= latestEdition.maxCopies) {
-        throw new BadRequestException(
-          `Chapter ${item.chapter.chapterNumber} sold out before minting.`,
-        );
-      }
-
-      const serialNumber = latestEdition.mintedCopies + 1;
-      const mintedAsset = await this.solanaService.mintChapterAsset({
-        masterMintAddress: latestEdition.masterMintAddress,
-        destinationWalletAddress: ownershipWallet.address,
-        editionNumber: serialNumber,
-        collectionMintAddress: latestEdition.collectionMintAddress,
-      });
-
-      mintedAssets.push({
-        itemId: item.id,
-        ...mintedAsset,
-        serialNumber,
-      });
     }
 
-    const firstPurchasedChapterNumber =
-      payment.order.items
-        .map((item) => item.chapter?.chapterNumber ?? Number.MAX_SAFE_INTEGER)
-        .sort((left, right) => left - right)[0] ?? 1;
+    const totalGasLamports = mintedAssets.reduce(
+      (sum, asset) => sum + asset.feeInLamports,
+      0,
+    );
+    const gasQuote =
+      await this.priceQuoteService.lamportsToUsdcMinorWithLockedQuote(
+        totalGasLamports,
+      );
+
+    const mintedByItemId = new Set(mintedAssets.map((asset) => asset.itemId));
+    const mintedItems = payment.order.items.filter((item) =>
+      mintedByItemId.has(item.id),
+    );
+    const unmintedItems = payment.order.items.filter(
+      (item) => !mintedByItemId.has(item.id),
+    );
+    const mintedAmountInUsdcMinor = mintedItems.reduce(
+      (sum, item) => sum + item.amountInUsdcMinor,
+      0,
+    );
+    const releasedAmountInUsdcMinor =
+      payment.amountInUsdcMinor - mintedAmountInUsdcMinor;
+    const isPartial = mintFailure !== null && mintedItems.length > 0;
+    const isTotalFailure = mintedItems.length === 0;
 
     await this.prisma.$transaction(async (tx) => {
       await tx.payment.update({
         where: { id: payment.id },
         data: {
-          status: PaymentStatus.SUCCEEDED,
-          paidAt: new Date(),
+          status: isTotalFailure
+            ? PaymentStatus.FAILED
+            : PaymentStatus.SUCCEEDED,
+          paidAt: isTotalFailure ? null : new Date(),
           payerWalletAddress: ownershipWallet.address,
           recipientWalletAddress: payment.order.recipientWalletAddress,
-          buyerTokenAccountAddress: paymentTransfer.sourceTokenAccountAddress,
-          treasuryTokenAccountAddress:
-            paymentTransfer.destinationTokenAccountAddress,
-          chainTxSignature: paymentTransfer.signature,
-          confirmationSlot: paymentTransfer.confirmationSlot,
+          chainTxSignature: mintedAssets[0]?.signature,
+          confirmationSlot: mintedAssets[0]?.confirmationSlot ?? undefined,
           providerPayload: {
-            stage: 'completed',
+            stage: isTotalFailure ? 'failed' : 'completed',
             network: this.solanaService.getNetwork(),
             payerMode: ownershipWallet.custodyType,
-            treasuryTokenAccountAddress:
-              paymentTransfer.destinationTokenAccountAddress,
+            settlementMode: 'ledger-first',
+            totalGasFeeInUsdcMinor: gasQuote.feeInUsdcMinor,
+            totalGasLamports,
+            solUsdPriceLocked: gasQuote.solUsdPrice,
+            partialFulfillment: isPartial,
+            mintedChapters: mintedAssets.map((asset) => asset.chapterNumber),
+            failedChapters: unmintedItems
+              .map((item) => item.chapter?.chapterNumber)
+              .filter((chapterNumber): chapterNumber is number =>
+                Boolean(chapterNumber),
+              ),
+            failureReason:
+              mintFailure instanceof Error ? mintFailure.message : undefined,
           },
         },
       });
@@ -384,45 +661,72 @@ export class PaymentsService {
       await tx.order.update({
         where: { id: payment.orderId },
         data: {
-          status: 'COMPLETED',
+          status: isTotalFailure
+            ? OrderStatus.CANCELLED
+            : OrderStatus.COMPLETED,
           payerWalletAddress: ownershipWallet.address,
           recipientWalletAddress: payment.order.recipientWalletAddress,
         },
       });
 
-      await tx.onchainTransaction.create({
-        data: {
-          signature: paymentTransfer.signature,
-          network: this.solanaService.getNetwork(),
-          txType: OnchainTransactionType.USDC_TRANSFER,
-          status: OnchainTransactionStatus.CONFIRMED,
-          slot: paymentTransfer.confirmationSlot ?? undefined,
-          blockTime: paymentTransfer.blockTime ?? undefined,
-          confirmationCommitment:
-            this.solanaService.getConfirmationCommitment(),
-          metadataJson: {
-            purpose: 'chapter_purchase_payment',
-            sourceTokenAccountAddress:
-              paymentTransfer.sourceTokenAccountAddress,
-            destinationTokenAccountAddress:
-              paymentTransfer.destinationTokenAccountAddress,
+      if (mintedAmountInUsdcMinor > 0) {
+        await this.ledgerService.postEntry(
+          {
+            userId,
+            idempotencyKey: `purchase:debit:${payment.id}`,
+            type: LedgerEntryType.PURCHASE_DEBIT,
+            amountInUsdcMinor: -mintedAmountInUsdcMinor,
+            availableDeltaInUsdcMinor: 0,
+            pendingDeltaInUsdcMinor: -mintedAmountInUsdcMinor,
+            description: `Chapter purchase debited ${payment.reference}`,
+            reference: payment.reference,
+            mirrorWalletTransactionType: WalletTransactionType.PURCHASE,
           },
-          userId,
-          orderId: payment.orderId,
-          paymentId: payment.id,
-        },
-      });
+          tx,
+        );
+      }
 
-      for (const item of payment.order.items) {
+      if (releasedAmountInUsdcMinor > 0) {
+        await this.ledgerService.postEntry(
+          {
+            userId,
+            idempotencyKey: `purchase:release:${payment.id}`,
+            type: LedgerEntryType.PURCHASE_RELEASE,
+            amountInUsdcMinor: releasedAmountInUsdcMinor,
+            availableDeltaInUsdcMinor: releasedAmountInUsdcMinor,
+            pendingDeltaInUsdcMinor: -releasedAmountInUsdcMinor,
+            description: `Purchase hold released ${payment.reference}`,
+            reference: payment.reference,
+            mirrorWalletTransactionType: WalletTransactionType.ADJUSTMENT,
+          },
+          tx,
+        );
+      }
+
+      if (mintedAmountInUsdcMinor > 0) {
+        await this.ledgerService.postEntry(
+          {
+            userId,
+            idempotencyKey: `gas:purchase:${payment.id}`,
+            type: LedgerEntryType.GAS_FEE_DEBIT,
+            amountInUsdcMinor: -gasQuote.feeInUsdcMinor,
+            availableDeltaInUsdcMinor: -gasQuote.feeInUsdcMinor,
+            description: `Sponsored gas fee for ${payment.reference}`,
+            reference: payment.reference,
+            metadataJson: {
+              totalGasLamports,
+              solUsdPriceLocked: gasQuote.solUsdPrice,
+            },
+            mirrorWalletTransactionType: WalletTransactionType.GAS_FEE,
+          },
+          tx,
+        );
+      }
+
+      for (const item of mintedItems) {
         if (!item.chapter || !item.chapterEdition) {
           throw new BadRequestException(
             'Order item is missing chapter metadata.',
-          );
-        }
-
-        if (item.chapterEdition.mintedCopies >= item.chapterEdition.maxCopies) {
-          throw new BadRequestException(
-            `Chapter ${item.chapter.chapterNumber} sold out before minting.`,
           );
         }
 
@@ -479,6 +783,7 @@ export class PaymentsService {
               editionMetadataAddress: mintedAsset.editionMetadataAddress,
               serialNumber: mintedAsset.serialNumber,
               collectionMintAddress: item.chapterEdition.collectionMintAddress,
+              feeInLamports: mintedAsset.feeInLamports,
             },
             userId,
             bookId: item.offer.bookId,
@@ -488,55 +793,38 @@ export class PaymentsService {
           },
         });
 
-        const book = await tx.book.findUniqueOrThrow({
-          where: {
-            id: item.offer.bookId,
-          },
-        });
-
-        const wallet = await tx.wallet.upsert({
-          where: {
-            userId: book.authorId,
-          },
-          update: {
-            availableBalanceInUsdcMinor: {
-              increment: item.amountInUsdcMinor,
-            },
-          },
-          create: {
-            userId: book.authorId,
-            availableBalanceInUsdcMinor: item.amountInUsdcMinor,
-          },
-        });
-
-        await tx.walletTransaction.create({
-          data: {
-            walletId: wallet.id,
-            type: WalletTransactionType.SALE,
+        await this.ledgerService.postEntry(
+          {
+            userId: item.offer.book.authorId,
+            idempotencyKey: `sale:${payment.id}:${item.id}`,
+            type: LedgerEntryType.SALE_CREDIT,
             amountInUsdcMinor: item.amountInUsdcMinor,
+            availableDeltaInUsdcMinor: item.amountInUsdcMinor,
+            description: `Chapter sale credit for ${item.offer.title}`,
             reference: payment.reference,
-            description: `Onchain chapter sale for ${book.title} · ${item.offer.title}`,
+            mirrorWalletTransactionType: WalletTransactionType.SALE,
           },
-        });
+          tx,
+        );
 
         await tx.libraryItem.upsert({
           where: {
             userId_bookId: {
               userId,
-              bookId: book.id,
+              bookId: item.offer.bookId,
             },
           },
           update: {},
           create: {
             userId,
-            bookId: book.id,
+            bookId: item.offer.bookId,
           },
         });
 
         await tx.analyticsSnapshot.upsert({
           where: {
             bookId_date: {
-              bookId: book.id,
+              bookId: item.offer.bookId,
               date: new Date(new Date().toDateString()),
             },
           },
@@ -549,7 +837,7 @@ export class PaymentsService {
             },
           },
           create: {
-            bookId: book.id,
+            bookId: item.offer.bookId,
             date: new Date(new Date().toDateString()),
             purchases: 1,
             revenueInUsdcMinor: item.amountInUsdcMinor,
@@ -557,25 +845,106 @@ export class PaymentsService {
         });
       }
 
-      await tx.purchaseReservation.updateMany({
-        where: {
-          orderId: payment.orderId,
-          releasedAt: null,
-        },
-        data: {
-          fulfilledAt: new Date(),
-          releasedAt: new Date(),
-        },
-      });
+      for (const item of unmintedItems) {
+        if (!item.chapterEdition) {
+          continue;
+        }
+
+        await tx.chapterEdition.update({
+          where: { id: item.chapterEdition.id },
+          data: {
+            mintedCopies: {
+              decrement: 1,
+            },
+          },
+        });
+      }
+
+      if (mintedItems.length > 0) {
+        await tx.purchaseReservation.updateMany({
+          where: {
+            orderId: payment.orderId,
+            chapterEditionId: {
+              in: mintedItems
+                .map((item) => item.chapterEdition?.id)
+                .filter((id): id is string => Boolean(id)),
+            },
+            releasedAt: null,
+          },
+          data: {
+            fulfilledAt: new Date(),
+            releasedAt: new Date(),
+          },
+        });
+      }
+
+      if (unmintedItems.length > 0) {
+        await tx.purchaseReservation.updateMany({
+          where: {
+            orderId: payment.orderId,
+            chapterEditionId: {
+              in: unmintedItems
+                .map((item) => item.chapterEdition?.id)
+                .filter((id): id is string => Boolean(id)),
+            },
+            releasedAt: null,
+          },
+          data: {
+            releasedAt: new Date(),
+          },
+        });
+      }
     });
+
+    if (mintedItems.length > 0) {
+      await this.emailsService.sendPurchaseSuccessEmail({
+        to: payment.order.user.email,
+        displayName: payment.order.user.displayName,
+        bookTitle: payment.order.items[0]?.offer.book.title ?? 'your book',
+        chapterTitles: mintedItems
+          .map((item) =>
+            item.chapter
+              ? `Chapter ${item.chapter.chapterNumber}: ${item.chapter.title}`
+              : null,
+          )
+          .filter((item): item is string => Boolean(item)),
+        amountFormatted: formatCurrency(mintedAmountInUsdcMinor, 'USDC'),
+        reference,
+      });
+    }
+
+    if (isTotalFailure) {
+      throw new InternalServerErrorException(
+        'Minting failed before purchase completion. Funds were released back to your wallet.',
+      );
+    }
+
+    const purchasedChapterNumbers = mintedItems
+      .map((item) => item.chapter?.chapterNumber)
+      .filter((chapterNumber): chapterNumber is number =>
+        Boolean(chapterNumber),
+      )
+      .sort((left, right) => left - right);
 
     return {
       reference,
       status: 'SUCCEEDED',
       network: this.solanaService.getNetwork(),
-      chainTxSignature: paymentTransfer.signature,
-      formattedAmount: formatCurrency(payment.amountInUsdcMinor, 'USDC'),
-      firstPurchasedChapterNumber,
+      chainTxSignature: mintedAssets[0]?.signature ?? 'N/A',
+      formattedAmount: formatCurrency(mintedAmountInUsdcMinor, 'USDC'),
+      firstPurchasedChapterNumber:
+        purchasedChapterNumbers[0] ?? firstPurchasedChapterNumber,
+      gasFeeInUsdcMinor: gasQuote.feeInUsdcMinor,
+      formattedGasFee: formatCurrency(gasQuote.feeInUsdcMinor, 'USDC'),
+      partialFulfillment: isPartial,
+      failedChapterNumbers: isPartial
+        ? unmintedItems
+            .map((item) => item.chapter?.chapterNumber)
+            .filter((chapterNumber): chapterNumber is number =>
+              Boolean(chapterNumber),
+            )
+            .sort((left, right) => left - right)
+        : [],
     };
   }
 

@@ -1,5 +1,6 @@
 import { Module } from '@nestjs/common';
 import { PassportModule } from '@nestjs/passport';
+import { EmailsModule } from '../emails/emails.module';
 import { PrismaModule } from '../prisma/prisma.module';
 import { AuthController } from './auth.controller';
 import { AuthService } from './auth.service';
@@ -9,7 +10,11 @@ import { SessionAuthGuard } from './guards/session-auth.guard';
 import { GoogleStrategy } from './strategies/google.strategy';
 
 @Module({
-  imports: [PassportModule.register({ session: false }), PrismaModule],
+  imports: [
+    PassportModule.register({ session: false }),
+    PrismaModule,
+    EmailsModule,
+  ],
   controllers: [AuthController],
   providers: [
     AuthService,

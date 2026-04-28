@@ -13,7 +13,7 @@ WORKDIR /app
 ENV NODE_ENV="production"
 
 # Install pnpm
-ARG PNPM_VERSION=latest
+ARG PNPM_VERSION=10.17.1
 RUN npm install -g pnpm@$PNPM_VERSION
 
 
@@ -50,6 +50,12 @@ RUN apt-get update -qq && \
 # Copy built application
 COPY --from=build /app /app
 
+# Run as a non-root user in the final image.
+RUN groupadd --system appgroup && \
+    useradd --system --gid appgroup --home /app appuser && \
+    chown -R appuser:appgroup /app
+
 # Start the server by default, this can be overwritten at runtime
 EXPOSE 8080
-CMD [ "pnpm", "run", "start" ]
+USER appuser
+CMD [ "pnpm", "run", "start:prod" ]

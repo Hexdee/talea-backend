@@ -2,6 +2,7 @@ import {
   BadRequestException,
   Injectable,
   InternalServerErrorException,
+  ServiceUnavailableException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import {
@@ -56,6 +57,7 @@ type ChainTransfer = {
   blockTime: Date | null;
   sourceTokenAccountAddress: string;
   destinationTokenAccountAddress: string;
+  feeInLamports: number;
 };
 
 type MintedAsset = {
@@ -66,6 +68,7 @@ type MintedAsset = {
   signature: string;
   confirmationSlot: number | null;
   blockTime: Date | null;
+  feeInLamports: number;
 };
 
 type EditionAsset = {
@@ -77,6 +80,7 @@ type EditionAsset = {
   signature: string;
   confirmationSlot: number | null;
   blockTime: Date | null;
+  feeInLamports: number;
 };
 
 type CollectionAsset = {
@@ -87,6 +91,7 @@ type CollectionAsset = {
   signature: string;
   confirmationSlot: number | null;
   blockTime: Date | null;
+  feeInLamports: number;
 };
 
 type LatestDeposit = {
@@ -152,7 +157,15 @@ export class SolanaService {
   }
 
   private getUsdcMint() {
-    return new PublicKey(this.getUsdcMintAddress());
+    const mint = this.getUsdcMintAddress();
+    try {
+      return new PublicKey(mint);
+    } catch (error) {
+      throw new ServiceUnavailableException(
+        'SOLANA_USDC_MINT_ADDRESS is invalid. Configure a valid devnet USDC mint address.',
+        { cause: error },
+      );
+    }
   }
 
   private getTreasuryKeypair() {
@@ -183,7 +196,13 @@ export class SolanaService {
     return {
       slot: tx?.slot ?? null,
       blockTime: tx?.blockTime ? new Date(tx.blockTime * 1000) : null,
+      feeInLamports: tx?.meta?.fee ?? 0,
     };
+  }
+
+  async getTransactionFeeInLamports(signature: string) {
+    const meta = await this.getSlotAndBlockTime(signature);
+    return meta.feeInLamports;
   }
 
   private createUmiWithTreasury() {
@@ -306,17 +325,44 @@ export class SolanaService {
     };
   }
 
+  async getRecentUsdcDepositSignatures(ownerAddress: string, limit = 25) {
+    const tokenAccount = await getAssociatedTokenAddress(
+      this.getUsdcMint(),
+      new PublicKey(ownerAddress),
+    );
+    const signatures = await this.connection.getSignaturesForAddress(
+      tokenAccount,
+      { limit },
+      this.getFinalityCommitment(),
+    );
+
+    return {
+      tokenAccountAddress: tokenAccount.toBase58(),
+      signatures: signatures.map((item) => item.signature),
+    };
+  }
+
   async verifyUsdcDepositSignature(input: {
     signature: string;
     destinationOwnerAddress: string;
   }) {
-    const transaction = await this.connection.getParsedTransaction(
-      input.signature,
-      {
-        commitment: this.getFinalityCommitment(),
-        maxSupportedTransactionVersion: 0,
-      },
-    );
+    let transaction: Awaited<
+      ReturnType<Connection['getParsedTransaction']>
+    > | null = null;
+    try {
+      transaction = await this.connection.getParsedTransaction(
+        input.signature,
+        {
+          commitment: this.getFinalityCommitment(),
+          maxSupportedTransactionVersion: 0,
+        },
+      );
+    } catch (error) {
+      throw new BadRequestException(
+        'Invalid deposit signature or unsupported transaction format.',
+        { cause: error },
+      );
+    }
 
     if (!transaction?.meta) {
       throw new BadRequestException('Deposit transaction was not found.');
@@ -343,6 +389,12 @@ export class SolanaService {
     return {
       signature: input.signature,
       amountInUsdcMinor: Number(delta),
+      tokenAccountAddress: (
+        await getAssociatedTokenAddress(
+          this.getUsdcMint(),
+          new PublicKey(input.destinationOwnerAddress),
+        )
+      ).toBase58(),
       confirmationSlot: transaction.slot,
       blockTime: transaction.blockTime
         ? new Date(transaction.blockTime * 1000)
@@ -397,6 +449,7 @@ export class SolanaService {
       blockTime: meta.blockTime,
       sourceTokenAccountAddress: source.toBase58(),
       destinationTokenAccountAddress: destination.toBase58(),
+      feeInLamports: meta.feeInLamports,
     };
   }
 
@@ -445,6 +498,7 @@ export class SolanaService {
       blockTime: meta.blockTime,
       sourceTokenAccountAddress: source.toBase58(),
       destinationTokenAccountAddress: destination.toBase58(),
+      feeInLamports: meta.feeInLamports,
     };
   }
 
@@ -512,6 +566,7 @@ export class SolanaService {
       signature,
       confirmationSlot: meta.slot,
       blockTime: meta.blockTime,
+      feeInLamports: meta.feeInLamports,
     };
   }
 
@@ -556,6 +611,7 @@ export class SolanaService {
       signature,
       confirmationSlot: meta.slot,
       blockTime: meta.blockTime,
+      feeInLamports: meta.feeInLamports,
     };
   }
 
@@ -587,6 +643,7 @@ export class SolanaService {
       signature,
       confirmationSlot: meta.slot,
       blockTime: meta.blockTime,
+      feeInLamports: meta.feeInLamports,
     };
   }
 
@@ -650,6 +707,7 @@ export class SolanaService {
       signature,
       confirmationSlot: meta.slot,
       blockTime: meta.blockTime,
+      feeInLamports: meta.feeInLamports,
     };
   }
 

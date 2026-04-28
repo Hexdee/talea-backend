@@ -11,6 +11,7 @@ import { ApiTags } from '@nestjs/swagger';
 import { CurrentUser } from '../auth/decorators/current-user.decorator';
 import { SessionAuthGuard } from '../auth/guards/session-auth.guard';
 import type { SessionUser } from '../common/types/authenticated-request';
+import { CreateOnrampIntentDto } from '../transak/dto/transak.dto';
 import {
   CreatePayoutAccountDto,
   CreatePayoutRequestDto,
@@ -81,5 +82,14 @@ export class WalletController {
     @Body() dto: VerifyDepositDto,
   ) {
     return this.walletService.verifyDeposit(user.id, dto);
+  }
+
+  @Post('transak/onramp-intents')
+  @Version('1')
+  createOnrampIntent(
+    @CurrentUser() user: SessionUser,
+    @Body() dto: CreateOnrampIntentDto,
+  ) {
+    return this.walletService.createOnrampIntent(user.id, dto);
   }
 }
