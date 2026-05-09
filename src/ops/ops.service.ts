@@ -11,19 +11,12 @@ export class OpsService {
   ) {}
 
   async getDashboard() {
-    const [pendingPayouts, failedWebhooks, stuckChainTx, deadLetterPayouts] =
-      await Promise.all([
+    const [pendingPayouts, stuckChainTx, deadLetterPayouts] = await Promise.all(
+      [
         this.prisma.payoutRequest.count({
           where: {
             status: {
               in: ['REQUESTED', 'REVIEWING', 'APPROVED'],
-            },
-          },
-        }),
-        this.prisma.transakWebhookEvent.count({
-          where: {
-            errorMessage: {
-              not: null,
             },
           },
         }),
@@ -37,7 +30,8 @@ export class OpsService {
             status: 'DEAD_LETTER',
           },
         }),
-      ]);
+      ],
+    );
 
     const ledgerMismatches = await this.prisma.$queryRaw<
       Array<{ mismatch_count: bigint }>
@@ -58,7 +52,7 @@ export class OpsService {
     return {
       ledgerMismatchCount: Number(ledgerMismatches[0]?.mismatch_count ?? 0n),
       pendingPayoutCount: pendingPayouts,
-      failedWebhookCount: failedWebhooks,
+      failedWebhookCount: 0,
       failedOnchainTxCount: stuckChainTx,
       deadLetterPayoutCount: deadLetterPayouts,
     };

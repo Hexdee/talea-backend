@@ -5,6 +5,7 @@ import {
   IsEnum,
   IsOptional,
   IsString,
+  ValidateIf,
 } from 'class-validator';
 
 export class QuotePurchaseDto {
@@ -12,10 +13,16 @@ export class QuotePurchaseDto {
   @IsString()
   slug!: string;
 
-  @ApiProperty({ type: [Number] })
+  @ApiPropertyOptional({ description: 'Optional offer id to purchase.' })
+  @IsOptional()
+  @IsString()
+  offerId?: string;
+
+  @ApiPropertyOptional({ type: [Number] })
+  @ValidateIf((value: QuotePurchaseDto) => !value.offerId)
   @IsArray()
   @ArrayNotEmpty()
-  chapterNumbers!: number[];
+  chapterNumbers?: number[];
 }
 
 export class CreateSolanaPaymentDto extends QuotePurchaseDto {

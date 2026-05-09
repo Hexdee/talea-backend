@@ -2,13 +2,16 @@ import {
   BadRequestException,
   Injectable,
   InternalServerErrorException,
+  Logger,
   ServiceUnavailableException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import {
   Connection,
   Keypair,
+  LAMPORTS_PER_SOL,
   PublicKey,
+  SendTransactionError,
   Transaction,
   sendAndConfirmTransaction,
 } from '@solana/web3.js';
@@ -23,22 +26,26 @@ import {
   base58,
   generateSigner,
   keypairIdentity,
+  keypairPayer,
   none,
   percentAmount,
   publicKey,
   some,
+  TransactionBuilder,
 } from '@metaplex-foundation/umi';
 import { createUmi } from '@metaplex-foundation/umi-bundle-defaults';
 import {
-  collectionDetails,
+  collectionToggle,
   createNft,
   findMasterEditionPda,
   findMetadataPda,
   mplTokenMetadata,
+  safeFetchMetadata,
   printSupply,
   printV1,
-  setAndVerifySizedCollectionItem,
   TokenStandard,
+  updateV1,
+  verifyCollectionV1,
 } from '@metaplex-foundation/mpl-token-metadata';
 import {
   fromWeb3JsKeypair,
@@ -100,6 +107,10 @@ type LatestDeposit = {
   tokenAccountAddress: string;
 };
 
+type UmiSendAndConfirmResult = Awaited<
+  ReturnType<TransactionBuilder['sendAndConfirm']>
+>;
+
 function parseSecretKey(value: string, label: string) {
   const trimmed = value.trim();
 
@@ -123,7 +134,11 @@ function signatureToBase58(signature: Uint8Array) {
 
 @Injectable()
 export class SolanaService {
+  private static readonly MPL_TOKEN_METADATA_PROGRAM_ID =
+    'metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s';
+
   private readonly connection: Connection;
+  private readonly logger = new Logger(SolanaService.name);
 
   constructor(
     private readonly configService: ConfigService,
@@ -214,6 +229,146 @@ export class SolanaService {
     return { treasury, umi };
   }
 
+  private createUmiWithTreasuryPayer(identity?: Keypair) {
+    const treasury = this.getTreasuryKeypair();
+    const umi = createUmi(this.connection.rpcEndpoint).use(mplTokenMetadata());
+    const effectiveIdentity = identity ?? treasury;
+
+    // Keep identity and fee-payer separate: identity signs authority actions,
+    // treasury pays for fees/rent.
+    umi.use(keypairIdentity(fromWeb3JsKeypair(effectiveIdentity), false));
+    umi.use(keypairPayer(fromWeb3JsKeypair(treasury)));
+
+    return { treasury, umi };
+  }
+
+  private getTreasuryMinLamports() {
+    return Number(
+      this.configService.get<string>(
+        'SOLANA_TREASURY_MIN_LAMPORTS',
+        '20000000',
+      ),
+    );
+  }
+
+  private formatLamports(lamports: number) {
+    const sol = lamports / LAMPORTS_PER_SOL;
+    return `${lamports} lamports (${sol.toFixed(4)} SOL)`;
+  }
+
+  private async assertSignerCanPayFees(signer: Keypair, label: string) {
+    const account = await this.connection.getAccountInfo(
+      signer.publicKey,
+      this.getFinalityCommitment(),
+    );
+    if (!account) {
+      throw new ServiceUnavailableException(
+        `${label} wallet is not funded on ${this.getNetwork()} (account does not exist). Fund ${signer.publicKey.toBase58()} with SOL to pay transaction fees.`,
+      );
+    }
+
+    const balance = await this.connection.getBalance(
+      signer.publicKey,
+      this.getFinalityCommitment(),
+    );
+    const minimum = this.getTreasuryMinLamports();
+    if (balance < minimum) {
+      throw new ServiceUnavailableException(
+        `${label} wallet has insufficient SOL for fees on ${this.getNetwork()}. Balance: ${this.formatLamports(
+          balance,
+        )}. Minimum: ${this.formatLamports(minimum)}. Fund ${signer.publicKey.toBase58()} with SOL.`,
+      );
+    }
+  }
+
+  private async waitForAccountOwnedBy(input: {
+    address: string;
+    owner: string;
+    label: string;
+    timeoutMs?: number;
+    intervalMs?: number;
+  }) {
+    const timeoutMs = input.timeoutMs ?? 30_000;
+    const intervalMs = input.intervalMs ?? 1_000;
+    const startedAt = Date.now();
+
+    // eslint-disable-next-line no-constant-condition
+    while (true) {
+      const info = await this.connection.getAccountInfo(
+        new PublicKey(input.address),
+        this.getFinalityCommitment(),
+      );
+
+      if (info && info.owner.toBase58() === input.owner) {
+        return;
+      }
+
+      if (Date.now() - startedAt > timeoutMs) {
+        throw new ServiceUnavailableException(
+          `${input.label} account ${input.address} is not available on ${this.getNetwork()} yet (expected owner: ${input.owner}). Try again in a few seconds.`,
+        );
+      }
+
+      await new Promise((resolve) => setTimeout(resolve, intervalMs));
+    }
+  }
+
+  private async sendAndConfirmUmi(
+    builder: TransactionBuilder,
+    umi: ReturnType<typeof createUmi>,
+    context: string,
+  ): Promise<UmiSendAndConfirmResult> {
+    try {
+      return await builder.sendAndConfirm(umi, {
+        confirm: {
+          commitment: this.getConfirmationCommitment(),
+        },
+      });
+    } catch (error) {
+      if (error instanceof SendTransactionError) {
+        let logs: string[] | undefined;
+        try {
+          logs = await error.getLogs(this.connection);
+        } catch {
+          logs = undefined;
+        }
+
+        const message = String(error.message ?? 'SendTransactionError');
+        const joinedLogs = logs?.join('\n') ?? '';
+        if (
+          message.includes(
+            'Attempt to debit an account but found no record of a prior credit',
+          )
+        ) {
+          throw new ServiceUnavailableException(
+            `${context} failed because the fee payer account is unfunded or does not exist on-chain. Ensure SOLANA_TREASURY_SECRET_KEY points to a funded wallet on ${this.getNetwork()} (pubkey: ${this.getTreasuryKeypair().publicKey.toBase58()}).`,
+          );
+        }
+        if (
+          message.includes('IncorrectOwner') ||
+          joinedLogs.includes('Incorrect account owner')
+        ) {
+          this.logger.warn(
+            `${context} failed with IncorrectOwner. Logs:\n${joinedLogs || '(no logs)'}`,
+          );
+          throw new BadRequestException(
+            `${context} failed: Incorrect account owner. This usually means the stored collection mint address is not a valid Metaplex collection on the configured cluster, or SOLANA_RPC_URL / SOLANA_NETWORK do not match the chain you minted the collection on.`,
+          );
+        }
+
+        this.logger.error(
+          `${context} failed: ${message}${logs?.length ? `\nLogs:\n${joinedLogs}` : ''}`,
+        );
+        throw new InternalServerErrorException(
+          `${context} failed to send Solana transaction. ${message}`,
+          { cause: error },
+        );
+      }
+
+      throw error;
+    }
+  }
+
   private getCollectionAccounts(
     umi: ReturnType<typeof createUmi>,
     collectionMintAddress: string,
@@ -234,6 +389,7 @@ export class SolanaService {
   }
 
   private async ensureTokenAccount(owner: PublicKey, payer: Keypair) {
+    await this.assertSignerCanPayFees(payer, 'Fee payer');
     const tokenAccount = await getAssociatedTokenAddress(
       this.getUsdcMint(),
       owner,
@@ -250,9 +406,24 @@ export class SolanaService {
         ),
       );
 
-      await sendAndConfirmTransaction(this.connection, transaction, [payer], {
-        commitment: this.getConfirmationCommitment(),
-      });
+      try {
+        await sendAndConfirmTransaction(this.connection, transaction, [payer], {
+          commitment: this.getConfirmationCommitment(),
+        });
+      } catch (error) {
+        if (error instanceof SendTransactionError) {
+          let logs: string[] | undefined;
+          try {
+            logs = await error.getLogs(this.connection);
+          } catch {
+            logs = undefined;
+          }
+          this.logger.error(
+            `ensureTokenAccount failed: ${error.message}${logs?.length ? `\nLogs:\n${logs.join('\n')}` : ''}`,
+          );
+        }
+        throw error;
+      }
     }
 
     return tokenAccount;
@@ -408,6 +579,7 @@ export class SolanaService {
   }): Promise<ChainTransfer> {
     const buyer = this.decryptCustodialKeypair(input.encryptedPrivateKey);
     const treasury = this.getTreasuryKeypair();
+    await this.assertSignerCanPayFees(treasury, 'Treasury');
     const source = await this.ensureTokenAccount(buyer.publicKey, treasury);
     const destination = await this.ensureTokenAccount(
       treasury.publicKey,
@@ -435,12 +607,28 @@ export class SolanaService {
     );
     transaction.feePayer = treasury.publicKey;
 
-    const signature = await sendAndConfirmTransaction(
-      this.connection,
-      transaction,
-      [treasury, buyer],
-      { commitment: this.getConfirmationCommitment() },
-    );
+    let signature: string;
+    try {
+      signature = await sendAndConfirmTransaction(
+        this.connection,
+        transaction,
+        [treasury, buyer],
+        { commitment: this.getConfirmationCommitment() },
+      );
+    } catch (error) {
+      if (error instanceof SendTransactionError) {
+        let logs: string[] | undefined;
+        try {
+          logs = await error.getLogs(this.connection);
+        } catch {
+          logs = undefined;
+        }
+        this.logger.error(
+          `transferUsdcFromCustodialToTreasury failed: ${error.message}${logs?.length ? `\nLogs:\n${logs.join('\n')}` : ''}`,
+        );
+      }
+      throw error;
+    }
     const meta = await this.getSlotAndBlockTime(signature);
 
     return {
@@ -458,6 +646,7 @@ export class SolanaService {
     amountInUsdcMinor: number;
   }): Promise<ChainTransfer> {
     const treasury = this.getTreasuryKeypair();
+    await this.assertSignerCanPayFees(treasury, 'Treasury');
     const destinationOwner = new PublicKey(input.destinationWalletAddress);
     const source = await this.ensureTokenAccount(treasury.publicKey, treasury);
     const destination = await this.ensureTokenAccount(
@@ -484,12 +673,28 @@ export class SolanaService {
         BigInt(input.amountInUsdcMinor),
       ),
     );
-    const signature = await sendAndConfirmTransaction(
-      this.connection,
-      transaction,
-      [treasury],
-      { commitment: this.getConfirmationCommitment() },
-    );
+    let signature: string;
+    try {
+      signature = await sendAndConfirmTransaction(
+        this.connection,
+        transaction,
+        [treasury],
+        { commitment: this.getConfirmationCommitment() },
+      );
+    } catch (error) {
+      if (error instanceof SendTransactionError) {
+        let logs: string[] | undefined;
+        try {
+          logs = await error.getLogs(this.connection);
+        } catch {
+          logs = undefined;
+        }
+        this.logger.error(
+          `transferUsdcFromTreasuryToWallet failed: ${error.message}${logs?.length ? `\nLogs:\n${logs.join('\n')}` : ''}`,
+        );
+      }
+      throw error;
+    }
     const meta = await this.getSlotAndBlockTime(signature);
 
     return {
@@ -507,8 +712,13 @@ export class SolanaService {
     uri: string;
     maxCopies: number;
     collectionMintAddress?: string | null;
+    authorityEncryptedPrivateKey?: string | null;
   }): Promise<EditionAsset> {
-    const { umi } = this.createUmiWithTreasury();
+    const identity = input.authorityEncryptedPrivateKey
+      ? this.decryptCustodialKeypair(input.authorityEncryptedPrivateKey)
+      : undefined;
+    const { treasury, umi } = this.createUmiWithTreasuryPayer(identity);
+    await this.assertSignerCanPayFees(treasury, 'Treasury');
     const masterMint = generateSigner(umi);
     const metadata = findMetadataPda(umi, {
       mint: masterMint.publicKey,
@@ -516,7 +726,13 @@ export class SolanaService {
     const masterEdition = findMasterEditionPda(umi, {
       mint: masterMint.publicKey,
     });
-    let builder = createNft(umi, {
+    const collectionOption = input.collectionMintAddress
+      ? {
+          verified: false,
+          key: publicKey(input.collectionMintAddress),
+        }
+      : null;
+    const baseBuilder = createNft(umi, {
       mint: masterMint,
       name: input.name.slice(0, 32),
       symbol: 'LSPAD',
@@ -524,37 +740,54 @@ export class SolanaService {
       sellerFeeBasisPoints: percentAmount(0),
       isMutable: false,
       creators: none(),
-      collection: input.collectionMintAddress
-        ? some({
-            verified: false,
-            key: publicKey(input.collectionMintAddress),
-          })
-        : none(),
+      // Set the collection reference during creation, then verify it in a
+      // dedicated instruction.
+      collection: collectionOption,
       printSupply: some(printSupply('Limited', [input.maxCopies])),
     });
 
+    let builder = baseBuilder;
+    let collectionVerified = false;
     if (input.collectionMintAddress) {
-      const collection = this.getCollectionAccounts(
+      const collectionAccounts = this.getCollectionAccounts(
         umi,
         input.collectionMintAddress,
       );
+      // If the collection was minted moments ago, it may be confirmed but not
+      // yet visible for account reads on all RPC nodes. Token Metadata will
+      // fail with `IncorrectOwner` during verification if the collection
+      // metadata/master edition accounts are not readable yet.
+      await this.waitForAccountOwnedBy({
+        address: toWeb3JsPublicKey(collectionAccounts.collectionMetadata[0]).toBase58(),
+        owner: SolanaService.MPL_TOKEN_METADATA_PROGRAM_ID,
+        label: 'Collection metadata',
+      });
+      await this.waitForAccountOwnedBy({
+        address: toWeb3JsPublicKey(collectionAccounts.collectionMasterEdition[0]).toBase58(),
+        owner: SolanaService.MPL_TOKEN_METADATA_PROGRAM_ID,
+        label: 'Collection master edition',
+      });
 
-      builder = builder.add(
-        setAndVerifySizedCollectionItem(umi, {
+      builder = baseBuilder.add(
+        verifyCollectionV1(umi, {
           metadata,
-          collectionAuthority: umi.identity,
-          collectionMint: collection.collectionMint,
-          collection: collection.collectionMetadata,
-          collectionMasterEditionAccount: collection.collectionMasterEdition,
+          collectionMint: publicKey(input.collectionMintAddress),
+          authority: umi.identity,
         }),
       );
+      collectionVerified = true;
     }
 
-    const result = await builder.sendAndConfirm(umi, {
-      confirm: {
-        commitment: this.getConfirmationCommitment(),
-      },
-    });
+    let result: UmiSendAndConfirmResult;
+    try {
+      result = await this.sendAndConfirmUmi(
+        builder,
+        umi,
+        'createChapterEditionAsset',
+      );
+    } catch (error) {
+      throw error;
+    }
     const signature = signatureToBase58(result.signature);
     const meta = await this.getSlotAndBlockTime(signature);
 
@@ -562,7 +795,10 @@ export class SolanaService {
       masterMintAddress: toWeb3JsPublicKey(masterMint.publicKey).toBase58(),
       metadataAddress: toWeb3JsPublicKey(metadata[0]).toBase58(),
       masterEditionAddress: toWeb3JsPublicKey(masterEdition[0]).toBase58(),
-      collectionMintAddress: input.collectionMintAddress ?? null,
+      collectionMintAddress:
+        collectionVerified && input.collectionMintAddress
+          ? input.collectionMintAddress
+          : null,
       signature,
       confirmationSlot: meta.slot,
       blockTime: meta.blockTime,
@@ -573,8 +809,13 @@ export class SolanaService {
   async createBookCollectionAsset(input: {
     name: string;
     uri: string;
+    authorityEncryptedPrivateKey?: string | null;
   }): Promise<CollectionAsset> {
-    const { umi } = this.createUmiWithTreasury();
+    const identity = input.authorityEncryptedPrivateKey
+      ? this.decryptCustodialKeypair(input.authorityEncryptedPrivateKey)
+      : undefined;
+    const { treasury, umi } = this.createUmiWithTreasuryPayer(identity);
+    await this.assertSignerCanPayFees(treasury, 'Treasury');
     const collectionMint = generateSigner(umi);
     const metadata = findMetadataPda(umi, {
       mint: collectionMint.publicKey,
@@ -583,7 +824,7 @@ export class SolanaService {
       mint: collectionMint.publicKey,
     });
 
-    const result = await createNft(umi, {
+    const builder = createNft(umi, {
       mint: collectionMint,
       name: input.name.slice(0, 32),
       symbol: 'LSPAD',
@@ -593,12 +834,23 @@ export class SolanaService {
       creators: none(),
       collection: none(),
       isCollection: true,
-      collectionDetails: some(collectionDetails('V1', { size: 0 })),
-      printSupply: some(printSupply('Zero')),
-    }).sendAndConfirm(umi, {
-      confirm: {
-        commitment: this.getConfirmationCommitment(),
-      },
+    });
+    const result = await this.sendAndConfirmUmi(
+      builder,
+      umi,
+      'createBookCollectionAsset',
+    );
+    // Ensure the collection accounts are readable before we persist and
+    // immediately reuse the collection mint in chapter publishing flows.
+    await this.waitForAccountOwnedBy({
+      address: toWeb3JsPublicKey(metadata[0]).toBase58(),
+      owner: SolanaService.MPL_TOKEN_METADATA_PROGRAM_ID,
+      label: 'Collection metadata',
+    });
+    await this.waitForAccountOwnedBy({
+      address: toWeb3JsPublicKey(masterEdition[0]).toBase58(),
+      owner: SolanaService.MPL_TOKEN_METADATA_PROGRAM_ID,
+      label: 'Collection master edition',
     });
     const signature = signatureToBase58(result.signature);
     const meta = await this.getSlotAndBlockTime(signature);
@@ -618,24 +870,58 @@ export class SolanaService {
   async attachNftToCollection(input: {
     nftMetadataAddress: string;
     collectionMintAddress: string;
+    authorityEncryptedPrivateKey?: string | null;
   }) {
-    const { umi } = this.createUmiWithTreasury();
+    const identity = input.authorityEncryptedPrivateKey
+      ? this.decryptCustodialKeypair(input.authorityEncryptedPrivateKey)
+      : undefined;
+    const { treasury, umi } = this.createUmiWithTreasuryPayer(identity);
+    await this.assertSignerCanPayFees(treasury, 'Treasury');
     const collection = this.getCollectionAccounts(
       umi,
       input.collectionMintAddress,
     );
-
-    const result = await setAndVerifySizedCollectionItem(umi, {
-      metadata: publicKey(input.nftMetadataAddress),
-      collectionAuthority: umi.identity,
-      collectionMint: collection.collectionMint,
-      collection: collection.collectionMetadata,
-      collectionMasterEditionAccount: collection.collectionMasterEdition,
-    }).sendAndConfirm(umi, {
-      confirm: {
-        commitment: this.getConfirmationCommitment(),
-      },
+    await this.waitForAccountOwnedBy({
+      address: toWeb3JsPublicKey(collection.collectionMetadata[0]).toBase58(),
+      owner: SolanaService.MPL_TOKEN_METADATA_PROGRAM_ID,
+      label: 'Collection metadata',
     });
+    await this.waitForAccountOwnedBy({
+      address: toWeb3JsPublicKey(collection.collectionMasterEdition[0]).toBase58(),
+      owner: SolanaService.MPL_TOKEN_METADATA_PROGRAM_ID,
+      label: 'Collection master edition',
+    });
+
+    const nftMetadata = await safeFetchMetadata(
+      umi,
+      publicKey(input.nftMetadataAddress),
+    );
+    if (!nftMetadata) {
+      throw new BadRequestException(
+        `attachNftToCollection failed: metadata account ${input.nftMetadataAddress} does not exist on ${this.getNetwork()}.`,
+      );
+    }
+
+    const builder = updateV1(umi, {
+      mint: nftMetadata.mint,
+      metadata: publicKey(input.nftMetadataAddress),
+      payer: umi.payer,
+      authority: umi.identity,
+      collection: collectionToggle('Set', [
+        { verified: false, key: collection.collectionMint },
+      ]),
+    }).add(
+      verifyCollectionV1(umi, {
+        metadata: publicKey(input.nftMetadataAddress),
+        collectionMint: collection.collectionMint,
+        authority: umi.identity,
+      }),
+    );
+    const result = await this.sendAndConfirmUmi(
+      builder,
+      umi,
+      'attachNftToCollection',
+    );
     const signature = signatureToBase58(result.signature);
     const meta = await this.getSlotAndBlockTime(signature);
 
@@ -652,9 +938,16 @@ export class SolanaService {
     destinationWalletAddress: string;
     editionNumber: number;
     collectionMintAddress?: string | null;
+    masterTokenAccountOwnerEncryptedPrivateKey?: string | null;
   }): Promise<MintedAsset> {
     const destination = new PublicKey(input.destinationWalletAddress);
-    const { umi } = this.createUmiWithTreasury();
+    const identity = input.masterTokenAccountOwnerEncryptedPrivateKey
+      ? this.decryptCustodialKeypair(
+          input.masterTokenAccountOwnerEncryptedPrivateKey,
+        )
+      : undefined;
+    const { treasury, umi } = this.createUmiWithTreasuryPayer(identity);
+    await this.assertSignerCanPayFees(treasury, 'Treasury');
     const editionMint = generateSigner(umi);
     const metadata = findMetadataPda(umi, {
       mint: editionMint.publicKey,
@@ -670,28 +963,11 @@ export class SolanaService {
       editionNumber: input.editionNumber,
     });
 
-    if (input.collectionMintAddress) {
-      const collection = this.getCollectionAccounts(
-        umi,
-        input.collectionMintAddress,
-      );
-
-      builder = builder.add(
-        setAndVerifySizedCollectionItem(umi, {
-          metadata,
-          collectionAuthority: umi.identity,
-          collectionMint: collection.collectionMint,
-          collection: collection.collectionMetadata,
-          collectionMasterEditionAccount: collection.collectionMasterEdition,
-        }),
-      );
-    }
-
-    const result = await builder.sendAndConfirm(umi, {
-      confirm: {
-        commitment: this.getConfirmationCommitment(),
-      },
-    });
+    const result = await this.sendAndConfirmUmi(
+      builder,
+      umi,
+      'mintChapterAsset',
+    );
     const signature = signatureToBase58(result.signature);
     const meta = await this.getSlotAndBlockTime(signature);
     const mintAddress = toWeb3JsPublicKey(editionMint.publicKey);

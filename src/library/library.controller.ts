@@ -1,4 +1,14 @@
-import { Body, Controller, Get, Put, UseGuards, Version } from '@nestjs/common';
+import {
+  Body,
+  Controller,
+  Delete,
+  Get,
+  Param,
+  Patch,
+  Put,
+  UseGuards,
+  Version,
+} from '@nestjs/common';
 import { ApiTags } from '@nestjs/swagger';
 import { CurrentUser } from '../auth/decorators/current-user.decorator';
 import { SessionAuthGuard } from '../auth/guards/session-auth.guard';
@@ -35,5 +45,17 @@ export class LibraryController {
     @Body() dto: UpsertProgressDto,
   ) {
     return this.booksService.upsertProgress(user.id, dto);
+  }
+
+  @Patch('pins/:bookId')
+  @Version('1')
+  pinBook(@CurrentUser() user: SessionUser, @Param('bookId') bookId: string) {
+    return this.libraryService.pinBook(user.id, bookId);
+  }
+
+  @Delete('pins/:bookId')
+  @Version('1')
+  unpinBook(@CurrentUser() user: SessionUser, @Param('bookId') bookId: string) {
+    return this.libraryService.unpinBook(user.id, bookId);
   }
 }

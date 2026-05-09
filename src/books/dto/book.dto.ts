@@ -35,6 +35,20 @@ export class UpsertBookDto {
   @ApiPropertyOptional()
   @IsOptional()
   @IsString()
+  genre?: string;
+
+  @ApiPropertyOptional({
+    type: [String],
+  })
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(12)
+  @IsString({ each: true })
+  tags?: string[];
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
   coverImageUrl?: string;
 }
 

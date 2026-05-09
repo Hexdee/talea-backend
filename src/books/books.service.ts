@@ -6,6 +6,7 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { BookStatus, OfferType, SourceFormat } from '@prisma/client';
+import type { UserChainWallet } from '@prisma/client';
 import type { SessionUser } from '../common/types/authenticated-request';
 import { renderPublishedHtml } from '../common/utils/content';
 import { formatCurrency } from '../common/utils/currency';
@@ -33,6 +34,20 @@ function slugify(value: string) {
     .trim()
     .replace(/[^a-z0-9]+/g, '-')
     .replace(/(^-|-$)/g, '');
+}
+
+function isUniqueSlugConflict(error: unknown) {
+  const candidate = error as {
+    code?: unknown;
+    meta?: { target?: unknown };
+  } | null;
+
+  return (
+    Boolean(candidate) &&
+    candidate?.code === 'P2002' &&
+    Array.isArray(candidate?.meta?.target) &&
+    (candidate.meta.target as unknown[]).includes('slug')
+  );
 }
 
 type ChecklistItem = {
@@ -197,7 +212,10 @@ export class BooksService {
     return fallback;
   }
 
-  private async ensureBookCollection(bookId: string) {
+  private async ensureBookCollection(
+    bookId: string,
+    authorityWallet: UserChainWallet,
+  ) {
     const book = await this.prisma.book.findUnique({
       where: { id: bookId },
       include: {
@@ -247,6 +265,12 @@ export class BooksService {
       );
     }
 
+    if (!authorityWallet.encryptedPrivateKey) {
+      throw new BadRequestException(
+        'A custodial wallet is required to create an onchain collection for paid chapters.',
+      );
+    }
+
     const collectionMetadata = await this.ipfsService.uploadJson(
       `${book.slug}-collection-metadata`,
       {
@@ -269,6 +293,7 @@ export class BooksService {
     const collectionAsset = await this.solanaService.createBookCollectionAsset({
       name: `${book.title} Collection`,
       uri: collectionMetadata.uri,
+      authorityEncryptedPrivateKey: authorityWallet.encryptedPrivateKey,
     });
 
     const updated = await this.prisma.book.update({
@@ -469,7 +494,43 @@ export class BooksService {
   }
 
   async getFeaturedBooks(userId?: string) {
-    return this.listPublicBooks(userId, 8);
+    const featured = await this.prisma.featuredBook.findMany({
+      orderBy: {
+        rank: 'asc',
+      },
+      take: 8,
+      include: {
+        book: {
+          include: {
+            author: true,
+            chapters: {
+              include: {
+                edition: true,
+              },
+              orderBy: {
+                chapterNumber: 'asc',
+              },
+            },
+            offers: {
+              where: {
+                isActive: true,
+              },
+              orderBy: {
+                priceInUsdcMinor: 'asc',
+              },
+            },
+          },
+        },
+      },
+    });
+
+    if (featured.length === 0) {
+      return this.listPublicBooks(userId, 8);
+    }
+
+    return Promise.all(
+      featured.map((item) => this.serializePublicBook(item.book, userId)),
+    );
   }
 
   async listPublicBooks(userId?: string, take = 24) {
@@ -651,39 +712,93 @@ export class BooksService {
   }
 
   async createBook(user: SessionUser, dto: UpsertBookDto) {
-    return this.prisma.book.create({
-      data: {
-        title: dto.title,
-        slug: slugify(dto.title),
-        synopsis: dto.synopsis,
-        coverImageUrl: dto.coverImageUrl,
-        authorId: user.id,
-      },
-      include: {
-        chapters: {
-          include: {
-            edition: true,
-            chapterTokens: true,
-          },
+    const genre = dto.genre?.trim() || undefined;
+    const tags =
+      dto.tags
+        ?.map((tag) => tag.trim())
+        .filter(Boolean)
+        .slice(0, 12) ?? undefined;
+
+    const baseSlug = slugify(dto.title) || 'book';
+    const include = {
+      chapters: {
+        include: {
+          edition: true,
+          chapterTokens: true,
         },
-        offers: true,
-        readingProgress: true,
       },
-    });
+      offers: true,
+      readingProgress: true,
+    } as const;
+
+    for (let attempt = 0; attempt < 25; attempt += 1) {
+      const slug = attempt === 0 ? baseSlug : `${baseSlug}-${attempt + 1}`;
+
+      try {
+        return await this.prisma.book.create({
+          data: {
+            title: dto.title,
+            slug,
+            synopsis: dto.synopsis,
+            genre,
+            tags,
+            coverImageUrl: dto.coverImageUrl,
+            authorId: user.id,
+          },
+          include,
+        });
+      } catch (error) {
+        if (isUniqueSlugConflict(error)) {
+          continue;
+        }
+
+        throw error;
+      }
+    }
+
+    throw new BadRequestException(
+      'Could not create a unique book URL slug. Try a different title.',
+    );
   }
 
   async updateBook(userId: string, bookId: string, dto: UpsertBookDto) {
     await this.ensureBookOwner(userId, bookId);
 
-    return this.prisma.book.update({
-      where: { id: bookId },
-      data: {
-        title: dto.title,
-        slug: slugify(dto.title),
-        synopsis: dto.synopsis,
-        coverImageUrl: dto.coverImageUrl,
-      },
-    });
+    const genre = dto.genre?.trim() || undefined;
+    const tags =
+      dto.tags
+        ?.map((tag) => tag.trim())
+        .filter(Boolean)
+        .slice(0, 12) ?? undefined;
+
+    const baseSlug = slugify(dto.title) || 'book';
+    for (let attempt = 0; attempt < 25; attempt += 1) {
+      const slug = attempt === 0 ? baseSlug : `${baseSlug}-${attempt + 1}`;
+
+      try {
+        return await this.prisma.book.update({
+          where: { id: bookId },
+          data: {
+            title: dto.title,
+            slug,
+            synopsis: dto.synopsis,
+            genre,
+            tags,
+            coverImageUrl: dto.coverImageUrl,
+          },
+        });
+      } catch (error) {
+        if (isUniqueSlugConflict(error)) {
+          continue;
+        }
+
+        throw error;
+      }
+    }
+
+    throw new BadRequestException(
+      'Could not update book with a unique URL slug. Try a different title.',
+    );
   }
 
   async markBookComplete(userId: string, bookId: string) {
@@ -705,12 +820,6 @@ export class BooksService {
   ) {
     await this.ensureBookOwner(userId, bookId);
 
-    if (dto.type !== OfferType.SINGLE_CHAPTER) {
-      throw new BadRequestException(
-        'Lesenpad currently supports chapter-level blockchain editions only.',
-      );
-    }
-
     const existing = offerId
       ? await this.prisma.offer.findUnique({
           where: { id: offerId },
@@ -721,17 +830,120 @@ export class BooksService {
       throw new NotFoundException('Offer not found.');
     }
 
-    const chapter = await this.prisma.chapter.findFirst({
-      where: {
-        bookId,
-        chapterNumber: dto.chapterStart,
-      },
+    const book = await this.prisma.book.findUnique({
+      where: { id: bookId },
+      select: { status: true },
     });
 
-    if (!chapter) {
-      throw new BadRequestException(
-        'Single chapter offers must point to a valid chapter.',
-      );
+    if (!book) {
+      throw new NotFoundException('Book not found.');
+    }
+
+    let chapterId: string | null = null;
+    let chapterStart: number | null = dto.chapterStart ?? null;
+    let chapterEnd: number | null = dto.chapterEnd ?? null;
+
+    if (dto.type === OfferType.SINGLE_CHAPTER) {
+      if (
+        typeof dto.chapterStart !== 'number' ||
+        typeof dto.chapterEnd !== 'number'
+      ) {
+        throw new BadRequestException(
+          'Single chapter offers require chapterStart and chapterEnd.',
+        );
+      }
+
+      if (dto.chapterStart !== dto.chapterEnd) {
+        throw new BadRequestException(
+          'Single chapter offers require chapterStart to equal chapterEnd.',
+        );
+      }
+
+      const chapter = await this.prisma.chapter.findFirst({
+        where: {
+          bookId,
+          chapterNumber: dto.chapterStart,
+        },
+        select: { id: true },
+      });
+
+      if (!chapter) {
+        throw new BadRequestException(
+          'Single chapter offers must point to a valid chapter.',
+        );
+      }
+
+      chapterId = chapter.id;
+    } else if (dto.type === OfferType.CHAPTER_BUNDLE) {
+      if (
+        typeof dto.chapterStart !== 'number' ||
+        typeof dto.chapterEnd !== 'number'
+      ) {
+        throw new BadRequestException(
+          'Chapter bundles require chapterStart and chapterEnd.',
+        );
+      }
+
+      if (dto.chapterEnd <= dto.chapterStart) {
+        throw new BadRequestException(
+          'Chapter bundles must include at least two chapters.',
+        );
+      }
+
+      const chapters = await this.prisma.chapter.findMany({
+        where: {
+          bookId,
+          chapterNumber: {
+            gte: dto.chapterStart,
+            lte: dto.chapterEnd,
+          },
+          isFree: false,
+          publishedAt: {
+            not: null,
+          },
+          edition: {
+            isNot: null,
+          },
+        },
+        select: { id: true },
+      });
+
+      const expectedCount = dto.chapterEnd - dto.chapterStart + 1;
+      if (chapters.length !== expectedCount) {
+        throw new BadRequestException(
+          'Chapter bundles can only include paid, published chapters with active editions.',
+        );
+      }
+
+      chapterId = null;
+    } else if (dto.type === OfferType.FULL_BOOK) {
+      chapterStart = null;
+      chapterEnd = null;
+
+      if (book.status !== BookStatus.COMPLETED) {
+        throw new BadRequestException(
+          'Full book offers can only be created once a book is marked completed.',
+        );
+      }
+
+      const paidChapterCount = await this.prisma.chapter.count({
+        where: {
+          bookId,
+          isFree: false,
+          publishedAt: {
+            not: null,
+          },
+          edition: {
+            isNot: null,
+          },
+        },
+      });
+
+      if (paidChapterCount === 0) {
+        throw new BadRequestException(
+          'Full book offers require at least one paid published chapter.',
+        );
+      }
     }
 
     return this.prisma.offer.upsert({
@@ -742,20 +954,21 @@ export class BooksService {
         title: dto.title,
         description: dto.description,
         priceInUsdcMinor: dto.priceInUsdcMinor,
-        chapterStart: dto.chapterStart,
-        chapterEnd: dto.chapterEnd,
-        chapterId: chapter.id,
+        chapterStart,
+        chapterEnd,
+        chapterId,
         isActive: dto.isActive ?? true,
+        type: dto.type,
       },
       create: {
         bookId,
-        chapterId: chapter.id,
-        type: OfferType.SINGLE_CHAPTER,
+        chapterId,
+        type: dto.type,
         title: dto.title,
         description: dto.description,
         priceInUsdcMinor: dto.priceInUsdcMinor,
-        chapterStart: dto.chapterStart,
-        chapterEnd: dto.chapterEnd,
+        chapterStart,
+        chapterEnd,
         isActive: dto.isActive ?? true,
       },
     });
@@ -1017,7 +1230,7 @@ export class BooksService {
       dto.sellerWalletId,
     );
     const bookCollection = !dto.isFree
-      ? await this.ensureBookCollection(chapter.bookId)
+      ? await this.ensureBookCollection(chapter.bookId, sellerWallet)
       : null;
     const encrypted = await this.buildEncryptedChapterPackage(chapter);
     const nextRevision = chapter.publishedRevision + 1;
@@ -1069,6 +1282,7 @@ export class BooksService {
           await this.solanaService.attachNftToCollection({
             nftMetadataAddress: chapter.edition.metadataAddress,
             collectionMintAddress: bookCollection.collectionMintAddress,
+            authorityEncryptedPrivateKey: sellerWallet.encryptedPrivateKey,
           });
 
         editionAsset = {
@@ -1101,6 +1315,7 @@ export class BooksService {
         uri: metadataUpload.uri,
         maxCopies: dto.maxCopies!,
         collectionMintAddress: bookCollection?.collectionMintAddress,
+        authorityEncryptedPrivateKey: sellerWallet.encryptedPrivateKey,
       });
     }
 
@@ -1119,8 +1334,15 @@ export class BooksService {
         },
       });
 
-      await tx.encryptedChapterBlob.create({
-        data: {
+      await tx.encryptedChapterBlob.upsert({
+        where: {
+          chapterId_revision: {
+            chapterId,
+            revision: nextRevision,
+          },
+        },
+        update: {},
+        create: {
           chapterId,
           revision: nextRevision,
           storageProvider: 'IPFS',

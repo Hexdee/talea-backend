@@ -124,19 +124,6 @@ enum LedgerEntryType {
   ADJUSTMENT
 }
 
-enum TransakOrderType {
-  ONRAMP
-  OFFRAMP
-}
-
-enum TransakOrderStatus {
-  CREATED
-  PENDING
-  COMPLETED
-  FAILED
-  CANCELLED
-}
-
 model User {
   id                  String               @id @default(cuid())
   email               String               @unique
@@ -158,7 +145,6 @@ model User {
   chainWallets        UserChainWallet[]
   chapterTokens       ChapterToken[]
   onchainTransactions OnchainTransaction[]
-  transakOrders       TransakOrderIntent[]
   ledgerEntries       LedgerJournal[]
 }
 
@@ -227,6 +213,7 @@ model Book {
   status                         BookStatus               @default(DRAFT)
   authorId                       String
   author                         User                     @relation("AuthorBooks", fields: [authorId], references: [id], onDelete: Cascade)
+  featuredSlot                   FeaturedBook?
   chapters                       Chapter[]
   offers                         Offer[]
   entitlements                   Entitlement[]
@@ -236,6 +223,18 @@ model Book {
   onchainTransactions            OnchainTransaction[]
   createdAt                      DateTime                 @default(now())
   updatedAt                      DateTime                 @updatedAt
+}
+
+model FeaturedBook {
+  id        String   @id @default(cuid())
+  bookId    String   @unique
+  book      Book     @relation(fields: [bookId], references: [id], onDelete: Cascade)
+  rank      Int
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([rank])
+  @@index([rank])
 }
 
 model Chapter {
@@ -398,7 +397,6 @@ model Wallet {
   pendingBalanceInUsdcMinor   Int                 @default(0)
   transactions                WalletTransaction[]
   ledgerEntries               LedgerJournal[]
-  transakOrders               TransakOrderIntent[]
   createdAt                   DateTime            @default(now())
   updatedAt                   DateTime            @updatedAt
 }
@@ -469,7 +467,6 @@ model PayoutRequest {
   requestedAt         DateTime             @default(now())
   processedAt         DateTime?
   onchainTransactions OnchainTransaction[]
-  transakOrderIntent  TransakOrderIntent?
 }
 
 model AnalyticsSnapshot {
@@ -602,49 +599,6 @@ model PurchaseReservation {
 
   @@unique([orderId, chapterEditionId])
   @@index([expiresAt])
-}
-
-model TransakOrderIntent {
-  id                  String              @id @default(cuid())
-  userId              String
-  user                User                @relation(fields: [userId], references: [id], onDelete: Cascade)
-  walletId            String?
-  wallet              Wallet?             @relation(fields: [walletId], references: [id], onDelete: SetNull)
-  payoutRequestId     String?             @unique
-  payoutRequest       PayoutRequest?      @relation(fields: [payoutRequestId], references: [id], onDelete: SetNull)
-  type                TransakOrderType
-  status              TransakOrderStatus  @default(CREATED)
-  partnerOrderId      String              @unique
-  externalOrderId     String?             @unique
-  fiatCurrency        String?
-  fiatAmount          String?
-  cryptoCurrency      String              @default("USDC")
-  cryptoAmount        String?
-  walletAddress       String
-  transactionHash     String?
-  retryCount          Int                 @default(0)
-  lastReconciledAt    DateTime?
-  lastError           String?
-  payloadJson         Json?
-  createdAt           DateTime            @default(now())
-  updatedAt           DateTime            @updatedAt
-
-  @@index([userId, type, status])
-  @@index([walletAddress, status])
-}
-
-model TransakWebhookEvent {
-  id                String   @id @default(cuid())
-  eventKey          String   @unique
-  externalOrderId   String?
-  partnerOrderId    String?
-  eventType         String?
-  status            String?
-  signature         String?
-  payloadJson       Json
-  processedAt       DateTime?
-  errorMessage      String?
-  createdAt         DateTime @default(now())
 }
 
 model OnchainTransaction {

@@ -50,12 +50,6 @@ export const envSchema = z
     PINATA_JWT: requiredChainSecret('test-pinata-jwt'),
     IPFS_GATEWAY_BASE: z.string().optional(),
     COINGECKO_API_BASE: z.string().default('https://api.coingecko.com/api/v3'),
-    TRANSAK_ENABLED: z.enum(['true', 'false']).default('false'),
-    TRANSAK_API_KEY: z.string().optional(),
-    TRANSAK_API_SECRET: z.string().optional(),
-    TRANSAK_WEBHOOK_SECRET: z.string().optional(),
-    TRANSAK_ENVIRONMENT: z.enum(['STAGING', 'PRODUCTION']).default('STAGING'),
-    TRANSAK_WIDGET_URL: z.string().default('https://global.transak.com'),
     RISK_DAILY_PURCHASE_LIMIT_USDC_MINOR: integerString.default('200000000'),
     RISK_DAILY_WITHDRAWAL_LIMIT_USDC_MINOR: integerString.default('500000000'),
     RISK_PER_MINUTE_REQUEST_LIMIT: integerString.default('20'),
@@ -77,34 +71,6 @@ export const envSchema = z
       });
     }
 
-    if (config.TRANSAK_ENABLED !== 'true') {
-      return;
-    }
-
-    if (!config.TRANSAK_API_KEY?.trim()) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: ['TRANSAK_API_KEY'],
-        message: 'TRANSAK_API_KEY is required when TRANSAK_ENABLED=true.',
-      });
-    }
-
-    if (!config.TRANSAK_API_SECRET?.trim()) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: ['TRANSAK_API_SECRET'],
-        message: 'TRANSAK_API_SECRET is required when TRANSAK_ENABLED=true.',
-      });
-    }
-
-    if (!config.TRANSAK_WEBHOOK_SECRET?.trim()) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: ['TRANSAK_WEBHOOK_SECRET'],
-        message:
-          'TRANSAK_WEBHOOK_SECRET is required when TRANSAK_ENABLED=true.',
-      });
-    }
   });
 
 export type EnvSchema = z.infer<typeof envSchema>;

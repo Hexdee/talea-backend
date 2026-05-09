@@ -9,5 +9,6 @@ coverage
 .DS_Store
 uploads
 treasury.json
+treasury.json
 *.secret
 *.key

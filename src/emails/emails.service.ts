@@ -2,6 +2,7 @@ import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { Resend } from 'resend';
 import {
+  buildDepositReceivedEmailTemplate,
   buildPurchaseSuccessEmailTemplate,
   buildWelcomeEmailTemplate,
   buildWithdrawalCompletedEmailTemplate,
@@ -127,6 +128,31 @@ export class EmailsService {
       chapterTitles: params.chapterTitles,
       amountFormatted: params.amountFormatted,
       reference: params.reference,
+    });
+
+    await this.send({
+      to: params.to,
+      subject: emailTemplate.subject,
+      text: emailTemplate.text,
+      html: emailTemplate.html,
+    });
+  }
+
+  async sendDepositReceivedEmail(params: {
+    to: string;
+    displayName: string;
+    amountFormatted: string;
+    availableBalanceFormatted: string;
+    reference?: string | null;
+  }) {
+    const emailTemplate = buildDepositReceivedEmailTemplate({
+      appName: this.appName,
+      appUrl: this.frontendAppUrl,
+      logoUrl: this.logoUrl,
+      displayName: params.displayName,
+      amountFormatted: params.amountFormatted,
+      availableBalanceFormatted: params.availableBalanceFormatted,
+      reference: params.reference ?? null,
     });
 
     await this.send({

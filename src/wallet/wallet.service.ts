@@ -12,7 +12,6 @@ import {
   OnchainTransactionType,
   Prisma,
   PayoutRequestStatus,
-  TransakOrderStatus,
   WalletTransactionType,
   WithdrawalDestinationType,
 } from '@prisma/client';
@@ -22,11 +21,6 @@ import { formatCurrency } from '../common/utils/currency';
 import { EmailsService } from '../emails/emails.service';
 import { LedgerService } from '../ledger/ledger.service';
 import { PrismaService } from '../prisma/prisma.service';
-import { TransakService } from '../transak/transak.service';
-import {
-  CreateOnrampIntentDto,
-  TransakWebhookDto,
-} from '../transak/dto/transak.dto';
 import {
   CreatePayoutAccountDto,
   CreatePayoutRequestDto,
@@ -44,7 +38,6 @@ export class WalletService {
     @Inject(WALLET_PROVIDER)
     private readonly walletProvider: WalletProvider,
     private readonly ledgerService: LedgerService,
-    private readonly transakService: TransakService,
     private readonly emailsService: EmailsService,
   ) {}
 
@@ -193,6 +186,7 @@ export class WalletService {
     );
 
     let detectedAmountInUsdcMinor = 0;
+    const appliedSignatures: string[] = [];
     const orderedSignatures = [...deposits.signatures].reverse();
     for (const signature of orderedSignatures) {
       if (known.has(signature)) {
@@ -266,6 +260,7 @@ export class WalletService {
       });
 
       detectedAmountInUsdcMinor += verification.amountInUsdcMinor;
+      appliedSignatures.push(signature);
     }
 
     await this.prisma.userChainWallet.update({
@@ -276,6 +271,25 @@ export class WalletService {
         lastDepositSignature: orderedSignatures[orderedSignatures.length - 1],
       },
     });
+
+    if (detectedAmountInUsdcMinor > 0) {
+      const user = await this.getUserOrThrow(userId);
+      const wallet = await this.prisma.wallet.findUnique({
+        where: { userId },
+        select: { availableBalanceInUsdcMinor: true },
+      });
+
+      await this.emailsService.sendDepositReceivedEmail({
+        to: user.email,
+        displayName: user.displayName,
+        amountFormatted: formatCurrency(detectedAmountInUsdcMinor, 'USDC'),
+        availableBalanceFormatted: formatCurrency(
+          wallet?.availableBalanceInUsdcMinor ?? 0,
+          'USDC',
+        ),
+        reference: appliedSignatures[appliedSignatures.length - 1] ?? null,
+      });
+    }
 
     return {
       detectedAmountInUsdcMinor,
@@ -298,8 +312,7 @@ export class WalletService {
       },
     });
 
-    const [payoutAccounts, payoutRequests, chainWallets, transakOrders] =
-      await Promise.all([
+    const [payoutAccounts, payoutRequests, chainWallets] = await Promise.all([
         this.prisma.payoutAccount.findMany({
           where: { userId },
           orderBy: [{ isDefault: 'desc' }, { createdAt: 'desc' }],
@@ -316,11 +329,6 @@ export class WalletService {
         this.prisma.userChainWallet.findMany({
           where: { userId },
           orderBy: [{ isDefault: 'desc' }, { createdAt: 'asc' }],
-        }),
-        this.prisma.transakOrderIntent.findMany({
-          where: { userId },
-          orderBy: { createdAt: 'desc' },
-          take: 20,
         }),
       ]);
 
@@ -367,18 +375,6 @@ export class WalletService {
       wallet,
       payoutAccounts,
       payoutRequests,
-      transakOrders: transakOrders.map((order) => ({
-        id: order.id,
-        type: order.type,
-        status: order.status,
-        partnerOrderId: order.partnerOrderId,
-        externalOrderId: order.externalOrderId,
-        fiatCurrency: order.fiatCurrency,
-        fiatAmount: order.fiatAmount,
-        cryptoCurrency: order.cryptoCurrency,
-        cryptoAmount: order.cryptoAmount,
-        createdAt: order.createdAt,
-      })),
       treasurySettlement: {
         network: this.configService.get<string>('SOLANA_NETWORK', 'devnet'),
         usdcMintAddress: this.configService.get<string>(
@@ -401,32 +397,6 @@ export class WalletService {
         isCreatorPayoutWallet: item.isCreatorPayoutWallet,
         createdAt: item.createdAt,
       })),
-    };
-  }
-
-  async createOnrampIntent(userId: string, dto: CreateOnrampIntentDto) {
-    await this.enforceVelocity(userId, 'create onramp intent');
-    const user = await this.getUserOrThrow(userId);
-    const wallet = await this.getDefaultCustodialWallet(userId);
-    const intent = await this.transakService.createOnrampIntent({
-      userId,
-      walletId: null,
-      walletAddress: wallet.address,
-      partnerCustomerId: user.id,
-      fiatCurrency: dto.fiatCurrency,
-      fiatAmount: dto.fiatAmount,
-    });
-
-    return {
-      intentId: intent.id,
-      partnerOrderId: intent.partnerOrderId,
-      ...this.transakService.buildOnrampWidgetConfig({
-        walletAddress: wallet.address,
-        partnerOrderId: intent.partnerOrderId,
-        partnerCustomerId: user.id,
-        fiatCurrency: intent.fiatCurrency,
-        fiatAmount: intent.fiatAmount,
-      }),
     };
   }
 
@@ -717,70 +687,11 @@ export class WalletService {
       };
     }
 
-    if (!this.transakService.isEnabled()) {
-      throw new BadRequestException(
-        'Transak off-ramp is not enabled in this environment.',
-      );
+    if (payoutAccount.destinationType === WithdrawalDestinationType.BANK) {
+      throw new BadRequestException('Bank withdrawals are coming soon.');
     }
 
-    const holdIdempotency = `withdraw:hold:${userId}:${Date.now()}:${dto.amountInUsdcMinor}`;
-    await this.ledgerService.postEntry({
-      userId,
-      idempotencyKey: holdIdempotency,
-      type: LedgerEntryType.WITHDRAWAL_HOLD,
-      amountInUsdcMinor: -dto.amountInUsdcMinor,
-      availableDeltaInUsdcMinor: -dto.amountInUsdcMinor,
-      pendingDeltaInUsdcMinor: dto.amountInUsdcMinor,
-      description: 'Bank withdrawal hold placed',
-      reference: holdIdempotency,
-      mirrorWalletTransactionType: WalletTransactionType.PAYOUT_REQUEST,
-    });
-
-    const payoutRequest = await this.prisma.payoutRequest.create({
-      data: {
-        userId,
-        payoutAccountId: payoutAccount.id,
-        amountInUsdcMinor: dto.amountInUsdcMinor,
-        status: 'REVIEWING',
-      },
-    });
-
-    const custodialWallet = await this.getDefaultCustodialWallet(userId);
-    const offrampIntent = await this.transakService.createOfframpIntent({
-      userId,
-      walletId: wallet.id,
-      payoutRequestId: payoutRequest.id,
-      walletAddress: custodialWallet.address,
-      fiatCurrency: 'USD',
-      fiatAmount: (dto.amountInUsdcMinor / 1_000_000).toFixed(2),
-    });
-
-    await this.prisma.payoutRequest.update({
-      where: { id: payoutRequest.id },
-      data: {
-        externalReference: offrampIntent.partnerOrderId,
-      },
-    });
-
-    await this.emailsService.sendWithdrawalRequestedEmail({
-      to: user.email,
-      displayName: user.displayName,
-      amountFormatted: formatCurrency(dto.amountInUsdcMinor, 'USDC'),
-      destinationLabel: payoutAccount.label,
-      requestId: payoutRequest.id,
-    });
-
-    return {
-      id: payoutRequest.id,
-      status: payoutRequest.status,
-      transak: this.transakService.buildOnrampWidgetConfig({
-        walletAddress: custodialWallet.address,
-        partnerOrderId: offrampIntent.partnerOrderId,
-        partnerCustomerId: user.id,
-        fiatCurrency: 'USD',
-        fiatAmount: (dto.amountInUsdcMinor / 1_000_000).toFixed(2),
-      }),
-    };
+    throw new BadRequestException('Unsupported withdrawal destination.');
   }
 
   async refreshDeposits(userId: string) {
@@ -912,213 +823,11 @@ export class WalletService {
     };
   }
 
-  async handleTransakWebhook(
-    payload: TransakWebhookDto,
-    rawBody: string,
-    signature?: string,
-  ) {
-    this.transakService.verifyWebhookSignature(rawBody, signature ?? null);
-    const eventKey =
-      payload.eventId ||
-      `${payload.orderId ?? ''}:${payload.partnerOrderId ?? ''}:${payload.status ?? ''}`;
-    const event = await this.transakService.storeWebhookEvent({
-      eventKey,
-      eventType: payload.eventId,
-      status: payload.status,
-      signature,
-      externalOrderId: payload.orderId,
-      partnerOrderId: payload.partnerOrderId,
-      payloadJson: payload as unknown as Prisma.InputJsonValue,
-    });
-
-    if (event.alreadyProcessed) {
-      return { success: true, alreadyProcessed: true };
-    }
-
-    await this.transakService.updateIntentFromWebhook({
-      partnerOrderId: payload.partnerOrderId,
-      externalOrderId: payload.orderId,
-      status: payload.status,
-      transactionHash: payload.transactionHash,
-      walletAddress: payload.walletAddress,
-      cryptoCurrency: payload.cryptoCurrency,
-      cryptoAmount: payload.cryptoAmount,
-      fiatCurrency: payload.fiatCurrency,
-      fiatAmount: payload.fiatAmount,
-      payloadJson: payload as unknown as Prisma.InputJsonValue,
-    });
-
-    const intent = await this.transakService.findIntentByOrder({
-      partnerOrderId: payload.partnerOrderId,
-      externalOrderId: payload.orderId,
-    });
-
-    if (!intent) {
-      await this.prisma.transakWebhookEvent.update({
-        where: { id: event.event.id },
-        data: {
-          processedAt: new Date(),
-          errorMessage: 'Intent not found for webhook payload.',
-        },
-      });
-      return { success: true, matchedIntent: false };
-    }
-
-    if (
-      intent.type === 'ONRAMP' &&
-      intent.status === TransakOrderStatus.COMPLETED &&
-      intent.walletAddress
-    ) {
-      await this.refreshDepositsForWalletAddress(intent.walletAddress);
-    }
-
-    if (intent.type === 'OFFRAMP' && intent.payoutRequestId) {
-      const payoutRequest = intent.payoutRequest;
-
-      if (intent.status === TransakOrderStatus.COMPLETED && payoutRequest) {
-        await this.prisma.$transaction(async (tx) => {
-          await this.ledgerService.postEntry(
-            {
-              userId: intent.userId,
-              idempotencyKey: `withdraw:debit:${intent.payoutRequestId}`,
-              type: LedgerEntryType.WITHDRAWAL_DEBIT,
-              amountInUsdcMinor: -payoutRequest.amountInUsdcMinor,
-              availableDeltaInUsdcMinor: 0,
-              pendingDeltaInUsdcMinor: -payoutRequest.amountInUsdcMinor,
-              description: 'Bank off-ramp withdrawal debited',
-              reference: payload.orderId ?? payload.partnerOrderId,
-              mirrorWalletTransactionType:
-                WalletTransactionType.PAYOUT_COMPLETED,
-            },
-            tx,
-          );
-
-          await tx.payoutRequest.update({
-            where: { id: intent.payoutRequestId! },
-            data: {
-              status: PayoutRequestStatus.PAID,
-              processedAt: new Date(),
-              externalReference: payload.orderId ?? payload.partnerOrderId,
-            },
-          });
-        });
-      }
-
-      if (
-        (intent.status === TransakOrderStatus.FAILED ||
-          intent.status === TransakOrderStatus.CANCELLED) &&
-        payoutRequest
-      ) {
-        await this.prisma.$transaction(async (tx) => {
-          await this.ledgerService.postEntry(
-            {
-              userId: intent.userId,
-              idempotencyKey: `withdraw:release:${intent.payoutRequestId}`,
-              type: LedgerEntryType.WITHDRAWAL_RELEASE,
-              amountInUsdcMinor: payoutRequest.amountInUsdcMinor,
-              availableDeltaInUsdcMinor: payoutRequest.amountInUsdcMinor,
-              pendingDeltaInUsdcMinor: -payoutRequest.amountInUsdcMinor,
-              description: 'Bank withdrawal hold released',
-              reference: payload.orderId ?? payload.partnerOrderId,
-              mirrorWalletTransactionType: WalletTransactionType.ADJUSTMENT,
-            },
-            tx,
-          );
-
-          await tx.payoutRequest.update({
-            where: { id: intent.payoutRequestId! },
-            data: {
-              status: PayoutRequestStatus.REJECTED,
-              deadLetterReason:
-                payload.status ?? 'Transak reported a failed/cancelled payout.',
-              processedAt: new Date(),
-            },
-          });
-        });
-      }
-    }
-
-    await this.prisma.transakWebhookEvent.update({
-      where: { id: event.event.id },
-      data: {
-        processedAt: new Date(),
-      },
-    });
-
-    return { success: true, matchedIntent: true };
-  }
-
   async reconcilePendingOfframps() {
-    const staleAt = new Date(Date.now() - 45 * 60 * 1000);
-    const deadAt = new Date(Date.now() - 6 * 60 * 60 * 1000);
-    const pending = await this.prisma.payoutRequest.findMany({
-      where: {
-        status: {
-          in: [PayoutRequestStatus.REQUESTED, PayoutRequestStatus.REVIEWING],
-        },
-        requestedAt: {
-          lte: staleAt,
-        },
-      },
-      include: {
-        transakOrderIntent: true,
-      },
-      take: 200,
-    });
-
-    let retried = 0;
-    let deadLettered = 0;
-
-    for (const request of pending) {
-      if (request.requestedAt <= deadAt && request.retryCount >= 3) {
-        await this.prisma.$transaction(async (tx) => {
-          await this.ledgerService.postEntry(
-            {
-              userId: request.userId,
-              idempotencyKey: `withdraw:dead-release:${request.id}`,
-              type: LedgerEntryType.WITHDRAWAL_RELEASE,
-              amountInUsdcMinor: request.amountInUsdcMinor,
-              availableDeltaInUsdcMinor: request.amountInUsdcMinor,
-              pendingDeltaInUsdcMinor: -request.amountInUsdcMinor,
-              description: 'Dead-letter payout hold released',
-              reference: request.externalReference ?? request.id,
-              mirrorWalletTransactionType: WalletTransactionType.ADJUSTMENT,
-            },
-            tx,
-          );
-
-          await tx.payoutRequest.update({
-            where: { id: request.id },
-            data: {
-              status: PayoutRequestStatus.DEAD_LETTER,
-              deadLetterReason: 'Stuck payout exceeded retry threshold.',
-              processedAt: new Date(),
-            },
-          });
-        });
-        deadLettered += 1;
-        continue;
-      }
-
-      await this.prisma.payoutRequest.update({
-        where: { id: request.id },
-        data: {
-          retryCount: {
-            increment: 1,
-          },
-          lastRetryAt: new Date(),
-          notes:
-            request.transakOrderIntent?.status ??
-            'Queued for reconciliation retry',
-        },
-      });
-      retried += 1;
-    }
-
     return {
-      scanned: pending.length,
-      retried,
-      deadLettered,
+      scanned: 0,
+      retried: 0,
+      deadLettered: 0,
     };
   }
 }

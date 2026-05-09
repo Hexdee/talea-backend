@@ -31,6 +31,38 @@ function buildReference() {
   return `LSP-LEDGER-${Date.now()}-${Math.random().toString(36).slice(2, 8).toUpperCase()}`;
 }
 
+function allocateProportionalAmounts(
+  totalAmountInUsdcMinor: number,
+  weights: number[],
+) {
+  const normalizedWeights = weights.map((weight) => Math.max(0, weight));
+  const totalWeight = normalizedWeights.reduce(
+    (sum, weight) => sum + weight,
+    0,
+  );
+
+  if (totalAmountInUsdcMinor <= 0) {
+    return normalizedWeights.map(() => 0);
+  }
+
+  if (totalWeight <= 0) {
+    return normalizedWeights.map(() => 0);
+  }
+
+  const allocations = normalizedWeights.map((weight) =>
+    Math.floor((totalAmountInUsdcMinor * weight) / totalWeight),
+  );
+  let remainder =
+    totalAmountInUsdcMinor - allocations.reduce((sum, value) => sum + value, 0);
+
+  for (let index = 0; remainder > 0 && index < allocations.length; index += 1) {
+    allocations[index] += 1;
+    remainder -= 1;
+  }
+
+  return allocations;
+}
+
 @Injectable()
 export class PaymentsService {
   constructor(
@@ -109,6 +141,14 @@ export class PaymentsService {
       },
       include: {
         author: true,
+        offers: {
+          where: {
+            isActive: true,
+          },
+          orderBy: {
+            createdAt: 'asc',
+          },
+        },
         chapters: {
           include: {
             edition: true,
@@ -139,36 +179,106 @@ export class PaymentsService {
     const ownedChapterIds = new Set(
       ownedTokens.map((token) => token.chapterId),
     );
-    const selectedChapterNumbers = Array.from(new Set(dto.chapterNumbers)).sort(
-      (left, right) => left - right,
-    );
 
-    const selectedChapters = selectedChapterNumbers
-      .map((chapterNumber) =>
-        book.chapters.find(
-          (chapter) => chapter.chapterNumber === chapterNumber,
-        ),
-      )
-      .filter((chapter): chapter is NonNullable<typeof chapter> =>
-        Boolean(chapter),
+    const selectedOffer = dto.offerId
+      ? (book.offers.find((offer) => offer.id === dto.offerId) ?? null)
+      : null;
+
+    if (dto.offerId && !selectedOffer) {
+      throw new BadRequestException('Offer not found for this book.');
+    }
+
+    const selectedChapterNumbers = !dto.offerId
+      ? Array.from(new Set(dto.chapterNumbers ?? [])).sort(
+          (left, right) => left - right,
+        )
+      : null;
+
+    if (
+      !dto.offerId &&
+      (!selectedChapterNumbers || selectedChapterNumbers.length === 0)
+    ) {
+      throw new BadRequestException(
+        'Select one or more chapter numbers to purchase.',
       );
+    }
 
-    if (selectedChapters.length !== selectedChapterNumbers.length) {
+    const coveredChapters = selectedOffer
+      ? selectedOffer.type === 'FULL_BOOK'
+        ? book.status !== 'COMPLETED'
+          ? (() => {
+              throw new BadRequestException(
+                'Full book offers can only be purchased once the story is completed.',
+              );
+            })()
+          : book.chapters.filter(
+              (chapter) =>
+                chapter.publishedAt && !chapter.isFree && chapter.edition,
+            )
+        : selectedOffer.type === 'CHAPTER_BUNDLE'
+          ? (() => {
+              if (
+                typeof selectedOffer.chapterStart !== 'number' ||
+                typeof selectedOffer.chapterEnd !== 'number'
+              ) {
+                throw new BadRequestException(
+                  'Bundle offer is missing its chapter range.',
+                );
+              }
+              return book.chapters.filter(
+                (chapter) =>
+                  chapter.chapterNumber >= selectedOffer.chapterStart! &&
+                  chapter.chapterNumber <= selectedOffer.chapterEnd!,
+              );
+            })()
+          : (() => {
+              if (
+                typeof selectedOffer.chapterStart !== 'number' ||
+                typeof selectedOffer.chapterEnd !== 'number' ||
+                selectedOffer.chapterStart !== selectedOffer.chapterEnd
+              ) {
+                throw new BadRequestException(
+                  'Single chapter offer is missing its chapter number.',
+                );
+              }
+              const match = book.chapters.find(
+                (chapter) =>
+                  chapter.chapterNumber === selectedOffer.chapterStart,
+              );
+              return match ? [match] : [];
+            })()
+      : selectedChapterNumbers!
+          .map((chapterNumber) =>
+            book.chapters.find(
+              (chapter) => chapter.chapterNumber === chapterNumber,
+            ),
+          )
+          .filter((chapter): chapter is NonNullable<typeof chapter> =>
+            Boolean(chapter),
+          );
+
+    if (coveredChapters.length === 0) {
+      throw new BadRequestException(
+        'No chapters matched this purchase request.',
+      );
+    }
+
+    if (
+      selectedChapterNumbers &&
+      coveredChapters.length !== selectedChapterNumbers.length
+    ) {
       throw new BadRequestException(
         'One or more selected chapters do not exist.',
       );
     }
 
-    const purchasableChapters = selectedChapters.filter(
-      (chapter) => !chapter.isFree,
-    );
-
-    if (purchasableChapters.length === 0) {
+    const paidCovered = coveredChapters.filter((chapter) => !chapter.isFree);
+    if (paidCovered.length === 0) {
       throw new BadRequestException('Only paid chapters require purchase.');
     }
 
-    const unavailableChapter = purchasableChapters.find(
-      (chapter) => !chapter.edition || !chapter.offer,
+    const unavailableChapter = paidCovered.find(
+      (chapter) => !chapter.publishedAt || !chapter.edition,
     );
     if (unavailableChapter) {
       throw new BadRequestException(
@@ -176,16 +286,18 @@ export class PaymentsService {
       );
     }
 
-    const alreadyOwnedChapter = purchasableChapters.find((chapter) =>
-      ownedChapterIds.has(chapter.id),
+    const remainingChapters = paidCovered.filter(
+      (chapter) => !ownedChapterIds.has(chapter.id),
     );
-    if (alreadyOwnedChapter) {
+    if (remainingChapters.length === 0) {
       throw new BadRequestException(
-        `You already own Chapter ${alreadyOwnedChapter.chapterNumber}.`,
+        selectedOffer
+          ? 'You already own everything in this offer.'
+          : 'You already own every selected chapter.',
       );
     }
 
-    const soldOutChapter = purchasableChapters.find(
+    const soldOutChapter = remainingChapters.find(
       (chapter) =>
         chapter.edition &&
         chapter.edition.mintedCopies >= chapter.edition.maxCopies,
@@ -196,16 +308,59 @@ export class PaymentsService {
       );
     }
 
+    const coveredBasePrices = paidCovered.map(
+      (chapter) => chapter.edition!.priceInUsdcMinor,
+    );
+    const coveredBaseTotal = coveredBasePrices.reduce(
+      (sum, value) => sum + value,
+      0,
+    );
+    const remainingBasePrices = remainingChapters.map(
+      (chapter) => chapter.edition!.priceInUsdcMinor,
+    );
+    const remainingBaseTotal = remainingBasePrices.reduce(
+      (sum, value) => sum + value,
+      0,
+    );
+
+    const shouldApplyOfferPricing =
+      selectedOffer != null &&
+      (selectedOffer.type === 'CHAPTER_BUNDLE' ||
+        selectedOffer.type === 'FULL_BOOK');
+
+    const totalChargeInUsdcMinor = shouldApplyOfferPricing
+      ? Math.max(
+          1,
+          Math.round(
+            (selectedOffer.priceInUsdcMinor * remainingBaseTotal) /
+              Math.max(coveredBaseTotal, 1),
+          ),
+        )
+      : remainingBaseTotal;
+
+    const allocatedAmounts = shouldApplyOfferPricing
+      ? allocateProportionalAmounts(totalChargeInUsdcMinor, remainingBasePrices)
+      : remainingBasePrices;
+
     return {
       book,
-      items: purchasableChapters.map((chapter) => ({
+      offer: selectedOffer
+        ? {
+            id: selectedOffer.id,
+            type: selectedOffer.type,
+            title: selectedOffer.title,
+            priceInUsdcMinor: selectedOffer.priceInUsdcMinor,
+          }
+        : null,
+      totalChargeInUsdcMinor,
+      items: remainingChapters.map((chapter, index) => ({
         chapterId: chapter.id,
         chapterNumber: chapter.chapterNumber,
         title: chapter.title,
-        offerId: chapter.offer!.id,
+        offerId: selectedOffer?.id ?? chapter.offer!.id,
         editionId: chapter.edition!.id,
         sellerWalletAddress: chapter.edition!.sellerWalletAddress,
-        amountInUsdcMinor: chapter.edition!.priceInUsdcMinor,
+        amountInUsdcMinor: allocatedAmounts[index] ?? 0,
         maxCopies: chapter.edition!.maxCopies,
         mintedCopies: chapter.edition!.mintedCopies,
       })),
@@ -235,6 +390,7 @@ export class PaymentsService {
     );
 
     return {
+      offer: context.offer,
       slug: context.book.slug,
       title: context.book.title,
       totalAmountInUsdcMinor,
@@ -565,6 +721,27 @@ export class PaymentsService {
     }> = [];
     let mintFailure: unknown = null;
 
+    const sellerAddresses = Array.from(
+      new Set(
+        payment.order.items
+          .map((item) => item.chapterEdition?.sellerWalletAddress)
+          .filter((address): address is string => Boolean(address)),
+      ),
+    );
+    const sellerWallets = sellerAddresses.length
+      ? await this.prisma.userChainWallet.findMany({
+          where: {
+            address: {
+              in: sellerAddresses,
+            },
+            isActive: true,
+          },
+        })
+      : [];
+    const sellerWalletByAddress = new Map(
+      sellerWallets.map((wallet) => [wallet.address, wallet]),
+    );
+
     for (const item of payment.order.items) {
       try {
         if (!item.chapter || !item.chapterEdition) {
@@ -580,11 +757,22 @@ export class PaymentsService {
           );
         }
 
+        const sellerWallet = sellerWalletByAddress.get(
+          item.chapterEdition.sellerWalletAddress,
+        );
+        if (!sellerWallet?.encryptedPrivateKey) {
+          throw new BadRequestException(
+            'Paid chapter minting requires a custodial seller wallet.',
+          );
+        }
+
         const mintedAsset = await this.solanaService.mintChapterAsset({
           masterMintAddress: item.chapterEdition.masterMintAddress,
           destinationWalletAddress: ownershipWallet.address,
           editionNumber: reservedCopy.serialNumber,
           collectionMintAddress: item.chapterEdition.collectionMintAddress,
+          masterTokenAccountOwnerEncryptedPrivateKey:
+            sellerWallet.encryptedPrivateKey,
         });
 
         mintedAssets.push({

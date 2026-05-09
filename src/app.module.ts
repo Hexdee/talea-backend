@@ -3,6 +3,7 @@ import { APP_GUARD } from '@nestjs/core';
 import { ConfigModule } from '@nestjs/config';
 import { ThrottlerGuard, ThrottlerModule } from '@nestjs/throttler';
 import { AnalyticsModule } from './analytics/analytics.module';
+import { AdminModule } from './admin/admin.module';
 import { AuthModule } from './auth/auth.module';
 import { BlogModule } from './blog/blog.module';
 import { BooksModule } from './books/books.module';
@@ -16,7 +17,6 @@ import { OpsModule } from './ops/ops.module';
 import { PaymentsModule } from './payments/payments.module';
 import { PrismaModule } from './prisma/prisma.module';
 import { ReconciliationModule } from './reconciliation/reconciliation.module';
-import { TransakModule } from './transak/transak.module';
 import { WalletModule } from './wallet/wallet.module';
 
 @Module({
@@ -35,8 +35,8 @@ import { WalletModule } from './wallet/wallet.module';
     }),
     ChainModule,
     LedgerModule,
-    TransakModule,
     PrismaModule,
+    AdminModule,
     AuthModule,
     HealthModule,
     BlogModule,

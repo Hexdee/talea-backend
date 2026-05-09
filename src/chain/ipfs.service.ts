@@ -17,15 +17,54 @@ type IpfsUploadResult = {
 export class IpfsService {
   constructor(private readonly configService: ConfigService) {}
 
-  private getGatewayBase() {
-    return (
-      this.configService.get<string>('IPFS_GATEWAY_BASE')?.replace(/\/$/, '') ??
-      'https://gateway.pinata.cloud'
-    );
+  private normalizeGatewayBase(value: string) {
+    const trimmed = value.trim().replace(/\/$/, '');
+    if (!trimmed) {
+      return trimmed;
+    }
+
+    try {
+      return new URL(trimmed).toString().replace(/\/$/, '');
+    } catch {
+      // Allow configuring the gateway host without a scheme (eg "foo.mypinata.cloud").
+      return `https://${trimmed}`.replace(/\/$/, '');
+    }
   }
 
-  private getGatewayUrl(cid: string) {
-    return `${this.getGatewayBase()}/ipfs/${cid}`;
+  private getGatewayBase() {
+    const raw =
+      this.configService.get<string>('IPFS_GATEWAY_BASE') ??
+      'https://gateway.pinata.cloud';
+    return this.normalizeGatewayBase(raw);
+  }
+
+  private getReadGatewayBases() {
+    const raw = this.configService.get<string>('IPFS_READ_GATEWAY_BASES');
+    const bases = (raw
+      ? raw.split(',').map((value) => value.trim())
+      : [
+          // Prefer the configured gateway first for performance.
+          this.getGatewayBase(),
+          // Fallback public-good gateways (operated by IPFS Foundation/IPShipyard).
+          // Ref: https://ipfs.github.io/public-gateway-checker/
+          'https://ipfs.io',
+          'https://dweb.link',
+          'https://trustless-gateway.link',
+        ]
+    ).filter(Boolean);
+
+    // Normalize and de-duplicate.
+    const normalized: string[] = [];
+    for (const base of bases) {
+      const item = this.normalizeGatewayBase(base);
+      if (item && !normalized.includes(item)) normalized.push(item);
+    }
+
+    return normalized;
+  }
+
+  private getGatewayUrl(cid: string, gatewayBase = this.getGatewayBase()) {
+    return `${gatewayBase}/ipfs/${cid}`;
   }
 
   private async pinJson(
@@ -83,16 +122,52 @@ export class IpfsService {
   }
 
   async downloadJson<T = unknown>(cid: string): Promise<T> {
-    const response = await fetch(this.getGatewayUrl(cid));
+    const gateways = this.getReadGatewayBases();
+    const errors: string[] = [];
 
-    if (!response.ok) {
-      const body = await response.text();
-      throw new InternalServerErrorException(
-        `Pinata download failed with ${response.status}: ${body.slice(0, 300)}`,
-      );
+    for (const gatewayBase of gateways) {
+      let response: Response;
+      try {
+        response = await fetch(this.getGatewayUrl(cid, gatewayBase), {
+          signal: AbortSignal.timeout(15_000),
+          headers: {
+            accept: 'application/json',
+            'user-agent': 'lesenpad-backend',
+          },
+        });
+      } catch (error) {
+        errors.push(
+          `${gatewayBase}: ${
+            error instanceof Error ? error.message : 'Request failed'
+          }`,
+        );
+        continue;
+      }
+
+      if (!response.ok) {
+        const body = await response.text();
+        errors.push(
+          `${gatewayBase}: ${response.status} ${body.slice(0, 120)}`,
+        );
+        continue;
+      }
+
+      try {
+        return (await response.json()) as T;
+      } catch (error) {
+        errors.push(
+          `${gatewayBase}: invalid JSON response (${
+            error instanceof Error ? error.message : 'parse error'
+          })`,
+        );
+      }
     }
 
-    return (await response.json()) as T;
+    throw new InternalServerErrorException(
+      `IPFS download failed for CID ${cid}. Tried gateways:\n- ${errors.join(
+        '\n- ',
+      )}`,
+    );
   }
 
   async downloadEncryptedPackage(cid: string) {
