@@ -304,8 +304,17 @@ export class WalletService {
       create: { userId },
       include: {
         transactions: {
+          take: 30,
           orderBy: {
             createdAt: 'desc',
+          },
+          select: {
+            id: true,
+            type: true,
+            amountInUsdcMinor: true,
+            reference: true,
+            description: true,
+            createdAt: true,
           },
         },
       },
