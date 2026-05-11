@@ -352,7 +352,7 @@ export class SolanaService {
             `${context} failed with IncorrectOwner. Logs:\n${joinedLogs || '(no logs)'}`,
           );
           throw new BadRequestException(
-            `${context} failed: Incorrect account owner. This usually means the stored collection mint address is not a valid Metaplex collection on the configured cluster, or SOLANA_RPC_URL / SOLANA_NETWORK do not match the chain you minted the collection on.`,
+            `${context} failed: Incorrect account owner. This usually means one of the accounts passed into token-metadata verification is not a valid token-metadata account on the configured cluster. Common causes: (1) book.collectionMintAddress is wrong for this SOLANA_RPC_URL (devnet vs mainnet mismatch), (2) a stored chapter edition metadata/master edition address in the DB is stale/wrong for this cluster, or (3) RPC inconsistency right after minting/creating accounts. Re-run diagnostics for the specific book/chapter on the same RPC.`,
           );
         }
 
@@ -758,12 +758,16 @@ export class SolanaService {
       // fail with `IncorrectOwner` during verification if the collection
       // metadata/master edition accounts are not readable yet.
       await this.waitForAccountOwnedBy({
-        address: toWeb3JsPublicKey(collectionAccounts.collectionMetadata[0]).toBase58(),
+        address: toWeb3JsPublicKey(
+          collectionAccounts.collectionMetadata[0],
+        ).toBase58(),
         owner: SolanaService.MPL_TOKEN_METADATA_PROGRAM_ID,
         label: 'Collection metadata',
       });
       await this.waitForAccountOwnedBy({
-        address: toWeb3JsPublicKey(collectionAccounts.collectionMasterEdition[0]).toBase58(),
+        address: toWeb3JsPublicKey(
+          collectionAccounts.collectionMasterEdition[0],
+        ).toBase58(),
         owner: SolanaService.MPL_TOKEN_METADATA_PROGRAM_ID,
         label: 'Collection master edition',
       });
@@ -778,16 +782,11 @@ export class SolanaService {
       collectionVerified = true;
     }
 
-    let result: UmiSendAndConfirmResult;
-    try {
-      result = await this.sendAndConfirmUmi(
-        builder,
-        umi,
-        'createChapterEditionAsset',
-      );
-    } catch (error) {
-      throw error;
-    }
+    const result = await this.sendAndConfirmUmi(
+      builder,
+      umi,
+      'createChapterEditionAsset',
+    );
     const signature = signatureToBase58(result.signature);
     const meta = await this.getSlotAndBlockTime(signature);
 
@@ -887,7 +886,9 @@ export class SolanaService {
       label: 'Collection metadata',
     });
     await this.waitForAccountOwnedBy({
-      address: toWeb3JsPublicKey(collection.collectionMasterEdition[0]).toBase58(),
+      address: toWeb3JsPublicKey(
+        collection.collectionMasterEdition[0],
+      ).toBase58(),
       owner: SolanaService.MPL_TOKEN_METADATA_PROGRAM_ID,
       label: 'Collection master edition',
     });
