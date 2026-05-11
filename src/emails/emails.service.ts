@@ -169,6 +169,10 @@ export class EmailsService {
     displayName: string;
     bookTitle: string;
     chapterTitles: string[];
+    assetLinks?: Array<{
+      label: string;
+      url: string;
+    }>;
     failedChapterTitles?: string[];
     amountFormatted: string;
     reference: string;
@@ -180,6 +184,7 @@ export class EmailsService {
       displayName: params.displayName,
       bookTitle: params.bookTitle,
       chapterTitles: params.chapterTitles,
+      assetLinks: params.assetLinks,
       failedChapterTitles: params.failedChapterTitles,
       amountFormatted: params.amountFormatted,
       reference: params.reference,

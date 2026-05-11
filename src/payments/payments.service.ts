@@ -1094,6 +1094,39 @@ export class PaymentsService {
       });
 
       if (mintedItems.length > 0) {
+        const network = this.solanaService.getNetwork();
+        const explorerCluster =
+          network && network !== 'mainnet-beta'
+            ? `?cluster=${encodeURIComponent(network)}`
+            : '';
+        const mintedAssetLinks = mintedItems
+          .map((item) => {
+            const mintedAsset = mintedAssets.find(
+              (asset) => asset.itemId === item.id,
+            );
+            const chapterNumber = item.chapter?.chapterNumber;
+            if (!mintedAsset?.mintAddress) {
+              return null;
+            }
+
+            const label = chapterNumber
+              ? `View Chapter ${chapterNumber} asset`
+              : 'View chapter asset';
+
+            return {
+              label,
+              url: `https://explorer.solana.com/address/${mintedAsset.mintAddress}${explorerCluster}`,
+            };
+          })
+          .filter(
+            (
+              item,
+            ): item is {
+              label: string;
+              url: string;
+            } => Boolean(item),
+          );
+
         await this.emailsService.sendPurchaseSuccessEmail({
           to: payment.order.user.email,
           displayName: payment.order.user.displayName,
@@ -1110,6 +1143,7 @@ export class PaymentsService {
             : undefined,
           amountFormatted: formatCurrency(mintedAmountInUsdcMinor, 'USDC'),
           reference,
+          assetLinks: mintedAssetLinks.length ? mintedAssetLinks : undefined,
         });
       }
 

@@ -9,6 +9,10 @@ type PurchaseSuccessTemplateParams = {
   displayName: string;
   bookTitle: string;
   chapterTitles: string[];
+  assetLinks?: Array<{
+    label: string;
+    url: string;
+  }>;
   failedChapterTitles?: string[];
   amountFormatted: string;
   reference: string;
@@ -21,6 +25,7 @@ export function buildPurchaseSuccessEmailTemplate({
   displayName,
   bookTitle,
   chapterTitles,
+  assetLinks,
   failedChapterTitles,
   amountFormatted,
   reference,
@@ -44,6 +49,9 @@ export function buildPurchaseSuccessEmailTemplate({
   const title = isPartial
     ? 'Purchase partially completed'
     : 'Purchase confirmed';
+  const safeAssetLinks = (assetLinks ?? []).filter(
+    (item) => Boolean(item?.url?.trim()) && Boolean(item?.label?.trim()),
+  );
 
   const body = `
     <p style="margin:0 0 10px;">Hi ${safeName}, your purchase has been confirmed.</p>
@@ -52,6 +60,24 @@ export function buildPurchaseSuccessEmailTemplate({
     <p style="margin:0 0 14px;"><strong>Reference:</strong> ${safeReference}</p>
     <p style="margin:0 0 8px;"><strong>Chapters unlocked:</strong></p>
     <ul style="margin:0 0 14px;padding-left:20px;">${chapterItems}</ul>
+    ${
+      safeAssetLinks.length
+        ? `
+          <p style="margin:0 0 10px;"><strong>View your chapter asset on Solana:</strong></p>
+          <p style="margin:0 0 14px;">
+            ${safeAssetLinks
+              .map(
+                (item) => `
+                  <a href="${escapeHtml(item.url)}" style="display:inline-block;background:#10253f;color:#ffffff;text-decoration:none;padding:10px 16px;border-radius:999px;font-weight:600;margin:0 10px 10px 0;">
+                    ${escapeHtml(item.label)}
+                  </a>
+                `,
+              )
+              .join('')}
+          </p>
+        `
+        : ''
+    }
     ${
       isPartial
         ? `
@@ -74,6 +100,12 @@ export function buildPurchaseSuccessEmailTemplate({
     text: `Hi ${displayName},\n\nYour purchase for "${bookTitle}" is confirmed.\nReference: ${reference}\nAmount: ${amountFormatted}\nChapters unlocked: ${chapterTitles.join(', ')}${
       isPartial && failedChapters
         ? `\n\nNot unlocked: ${failedChapters.join(', ')}\nAny held funds for the missing chapters were released back to your wallet.`
+        : ''
+    }${
+      safeAssetLinks.length
+        ? `\n\nView chapter asset on Solana:\n${safeAssetLinks
+            .map((item) => `- ${item.label}: ${item.url}`)
+            .join('\n')}`
         : ''
     }`,
     html: renderBrandedLayout({
