@@ -40,7 +40,7 @@ export class PriceQuoteService {
           `${endpoint}/simple/price?ids=solana&vs_currencies=usd`,
           {
             headers: {
-              'accept': 'application/json',
+              accept: 'application/json',
               // Some public APIs throttle/deny requests without a UA.
               'user-agent': 'lesenpad-backend',
             },
@@ -55,6 +55,16 @@ export class PriceQuoteService {
               `CoinGecko returned 429; falling back to cached SOL/USD quote (${this.cachedSolUsdQuote.price}).`,
             );
             return this.cachedSolUsdQuote.price;
+          }
+
+          const fallback = Number(
+            this.configService.get<string>('SOL_USD_FALLBACK', '0'),
+          );
+          if (fallback > 0 && Number.isFinite(fallback)) {
+            this.logger.warn(
+              `CoinGecko returned ${response.status}; falling back to SOL_USD_FALLBACK (${fallback}).`,
+            );
+            return fallback;
           }
           throw new Error(`CoinGecko returned ${response.status}`);
         }
@@ -76,6 +86,22 @@ export class PriceQuoteService {
             error instanceof Error ? error.message : 'Unknown error'
           }`,
         );
+
+        if (this.cachedSolUsdQuote) {
+          this.logger.warn(
+            `Falling back to cached SOL/USD quote (${this.cachedSolUsdQuote.price}).`,
+          );
+          return this.cachedSolUsdQuote.price;
+        }
+
+        const fallback = Number(
+          this.configService.get<string>('SOL_USD_FALLBACK', '0'),
+        );
+        if (fallback > 0 && Number.isFinite(fallback)) {
+          this.logger.warn(`Falling back to SOL_USD_FALLBACK (${fallback}).`);
+          return fallback;
+        }
+
         throw error;
       } finally {
         this.inFlightSolUsdQuote = null;

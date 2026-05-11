@@ -25,6 +25,7 @@ export const envSchema = z
     FRONTEND_APP_URL: z.string().default('http://localhost:3000'),
     APP_NAME: z.string().default('Lesenpad'),
     EMAIL_BRAND_LOGO_URL: z.string().optional(),
+    EMAIL_BRAND_LOGO_URL_INVERTED: z.string().optional(),
     BACKEND_PUBLIC_URL: z.string().optional(),
     MEDIA_STORAGE_PROVIDER: z.enum(['r2']).default('r2'),
     R2_BUCKET: requiredStorageSetting('test-bucket'),
@@ -50,6 +51,7 @@ export const envSchema = z
     PINATA_JWT: requiredChainSecret('test-pinata-jwt'),
     IPFS_GATEWAY_BASE: z.string().optional(),
     COINGECKO_API_BASE: z.string().default('https://api.coingecko.com/api/v3'),
+    SOL_USD_FALLBACK: z.string().optional(),
     RISK_DAILY_PURCHASE_LIMIT_USDC_MINOR: integerString.default('200000000'),
     RISK_DAILY_WITHDRAWAL_LIMIT_USDC_MINOR: integerString.default('500000000'),
     RISK_PER_MINUTE_REQUEST_LIMIT: integerString.default('20'),
@@ -70,7 +72,6 @@ export const envSchema = z
         message: 'RESEND_API_KEY is required when EMAILS_ENABLED=true.',
       });
     }
-
   });
 
 export type EnvSchema = z.infer<typeof envSchema>;

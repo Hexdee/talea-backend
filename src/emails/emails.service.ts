@@ -3,6 +3,7 @@ import { ConfigService } from '@nestjs/config';
 import { Resend } from 'resend';
 import {
   buildDepositReceivedEmailTemplate,
+  buildPurchaseFailedEmailTemplate,
   buildPurchaseSuccessEmailTemplate,
   buildWelcomeEmailTemplate,
   buildWithdrawalCompletedEmailTemplate,
@@ -36,11 +37,11 @@ export class EmailsService {
       'Lesenpad <onboarding@resend.dev>',
     );
     this.replyTo = this.configService.get<string>('RESEND_REPLY_TO');
-    this.logoUrl = this.configService.get<string>('EMAIL_BRAND_LOGO_URL');
     this.frontendAppUrl = this.configService.get<string>(
       'FRONTEND_APP_URL',
       'http://localhost:3000',
     );
+    this.logoUrl = this.resolveEmailLogoUrl();
 
     const apiKey = this.configService.get<string>('RESEND_API_KEY');
     if (!this.enabled) {
@@ -57,6 +58,58 @@ export class EmailsService {
     }
 
     this.resend = new Resend(apiKey);
+  }
+
+  private deriveInvertedLogoUrl(logoUrl: string): string | undefined {
+    const url = logoUrl.trim();
+    if (!url) {
+      return undefined;
+    }
+
+    if (url.includes('lesenpad-inverted-logo.png')) {
+      return url;
+    }
+
+    if (url.includes('lesenpad-wordmark-inverted.png')) {
+      return url;
+    }
+
+    if (url.includes('lesenpad-logo-inverted.svg')) {
+      return url;
+    }
+
+    if (url.includes('lesenpad-logo.png')) {
+      return url.replace('lesenpad-logo.png', 'lesenpad-inverted-logo.png');
+    }
+
+    if (url.includes('lesenpad-wordmark.png')) {
+      return url.replace(
+        'lesenpad-wordmark.png',
+        'lesenpad-wordmark-inverted.png',
+      );
+    }
+
+    if (url.includes('lesenpad-logo.svg')) {
+      return url.replace('lesenpad-logo.svg', 'lesenpad-logo-inverted.svg');
+    }
+
+    return undefined;
+  }
+
+  private resolveEmailLogoUrl(): string | undefined {
+    const configuredInverted = this.configService.get<string>(
+      'EMAIL_BRAND_LOGO_URL_INVERTED',
+    );
+    if (configuredInverted?.trim()) {
+      return configuredInverted;
+    }
+
+    const configured = this.configService.get<string>('EMAIL_BRAND_LOGO_URL');
+    if (configured?.trim()) {
+      return this.deriveInvertedLogoUrl(configured) ?? configured;
+    }
+
+    return `${this.frontendAppUrl.replace(/\/$/, '')}/lesenpad-inverted-logo.png`;
   }
 
   private async send(options: SendEmailOptions) {
@@ -116,6 +169,7 @@ export class EmailsService {
     displayName: string;
     bookTitle: string;
     chapterTitles: string[];
+    failedChapterTitles?: string[];
     amountFormatted: string;
     reference: string;
   }) {
@@ -126,8 +180,38 @@ export class EmailsService {
       displayName: params.displayName,
       bookTitle: params.bookTitle,
       chapterTitles: params.chapterTitles,
+      failedChapterTitles: params.failedChapterTitles,
       amountFormatted: params.amountFormatted,
       reference: params.reference,
+    });
+
+    await this.send({
+      to: params.to,
+      subject: emailTemplate.subject,
+      text: emailTemplate.text,
+      html: emailTemplate.html,
+    });
+  }
+
+  async sendPurchaseFailedEmail(params: {
+    to: string;
+    displayName: string;
+    bookTitle: string;
+    chapterTitles: string[];
+    amountFormatted: string;
+    reference: string;
+    failureReason?: string;
+  }) {
+    const emailTemplate = buildPurchaseFailedEmailTemplate({
+      appName: this.appName,
+      appUrl: this.frontendAppUrl,
+      logoUrl: this.logoUrl,
+      displayName: params.displayName,
+      bookTitle: params.bookTitle,
+      chapterTitles: params.chapterTitles,
+      amountFormatted: params.amountFormatted,
+      reference: params.reference,
+      failureReason: params.failureReason,
     });
 
     await this.send({

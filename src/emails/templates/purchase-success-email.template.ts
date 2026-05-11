@@ -9,6 +9,7 @@ type PurchaseSuccessTemplateParams = {
   displayName: string;
   bookTitle: string;
   chapterTitles: string[];
+  failedChapterTitles?: string[];
   amountFormatted: string;
   reference: string;
 };
@@ -20,6 +21,7 @@ export function buildPurchaseSuccessEmailTemplate({
   displayName,
   bookTitle,
   chapterTitles,
+  failedChapterTitles,
   amountFormatted,
   reference,
 }: PurchaseSuccessTemplateParams): EmailTemplateResult {
@@ -30,6 +32,18 @@ export function buildPurchaseSuccessEmailTemplate({
   const chapterItems = chapterTitles
     .map((title) => `<li style="margin:0 0 6px;">${escapeHtml(title)}</li>`)
     .join('');
+  const failedChapters = failedChapterTitles?.length
+    ? failedChapterTitles
+    : null;
+  const failedItems = failedChapters
+    ? failedChapters
+        .map((title) => `<li style="margin:0 0 6px;">${escapeHtml(title)}</li>`)
+        .join('')
+    : '';
+  const isPartial = Boolean(failedChapters?.length);
+  const title = isPartial
+    ? 'Purchase partially completed'
+    : 'Purchase confirmed';
 
   const body = `
     <p style="margin:0 0 10px;">Hi ${safeName}, your purchase has been confirmed.</p>
@@ -38,19 +52,35 @@ export function buildPurchaseSuccessEmailTemplate({
     <p style="margin:0 0 14px;"><strong>Reference:</strong> ${safeReference}</p>
     <p style="margin:0 0 8px;"><strong>Chapters unlocked:</strong></p>
     <ul style="margin:0 0 14px;padding-left:20px;">${chapterItems}</ul>
+    ${
+      isPartial
+        ? `
+          <div style="margin:0 0 14px;padding:12px 14px;border-radius:14px;background:#fbf9f4;border:1px solid #ece5d7;">
+            <p style="margin:0 0 8px;"><strong>Some chapters could not be unlocked.</strong></p>
+            <p style="margin:0 0 10px;">Any funds held for the missing chapters were released back to your wallet.</p>
+            <p style="margin:0 0 8px;"><strong>Not unlocked:</strong></p>
+            <ul style="margin:0;padding-left:20px;">${failedItems}</ul>
+          </div>
+        `
+        : ''
+    }
     <p style="margin:0;">
       <a href="${escapeHtml(appUrl)}/library" style="display:inline-block;background:#10253f;color:#ffffff;text-decoration:none;padding:10px 16px;border-radius:999px;font-weight:600;">Open your library</a>
     </p>
   `;
 
   return {
-    subject: 'Purchase confirmed',
-    text: `Hi ${displayName},\n\nYour purchase for "${bookTitle}" is confirmed.\nReference: ${reference}\nAmount: ${amountFormatted}\nChapters: ${chapterTitles.join(', ')}`,
+    subject: title,
+    text: `Hi ${displayName},\n\nYour purchase for "${bookTitle}" is confirmed.\nReference: ${reference}\nAmount: ${amountFormatted}\nChapters unlocked: ${chapterTitles.join(', ')}${
+      isPartial && failedChapters
+        ? `\n\nNot unlocked: ${failedChapters.join(', ')}\nAny held funds for the missing chapters were released back to your wallet.`
+        : ''
+    }`,
     html: renderBrandedLayout({
       appName,
       appUrl,
       logoUrl,
-      title: 'Purchase confirmed',
+      title,
       body,
     }),
   };
