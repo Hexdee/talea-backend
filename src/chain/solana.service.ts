@@ -884,14 +884,20 @@ export class SolanaService {
             balance.owner === transfer.destinationOwnerAddress &&
             balance.mint === mint,
         )
-        .reduce((sum, balance) => sum + BigInt(balance.uiTokenAmount.amount), 0n);
+        .reduce(
+          (sum, balance) => sum + BigInt(balance.uiTokenAmount.amount),
+          0n,
+        );
       const destinationAfter = post
         .filter(
           (balance) =>
             balance.owner === transfer.destinationOwnerAddress &&
             balance.mint === mint,
         )
-        .reduce((sum, balance) => sum + BigInt(balance.uiTokenAmount.amount), 0n);
+        .reduce(
+          (sum, balance) => sum + BigInt(balance.uiTokenAmount.amount),
+          0n,
+        );
 
       const expected = BigInt(transfer.amountInUsdcMinor);
       if (destinationAfter - destinationBefore !== expected) {

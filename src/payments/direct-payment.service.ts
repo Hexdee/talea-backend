@@ -183,19 +183,19 @@ export class DirectPaymentService {
 
     const transfer =
       await this.solanaService.verifyUsdcTransferSignatureWithRecipients({
-      signature: chainTxSignature,
-      sourceOwnerAddress: payerWalletAddress,
-      recipientTransfers: [
-        {
-          destinationOwnerAddress: recipientWalletAddress,
-          amountInUsdcMinor: sellerNetAmountInUsdcMinor,
-        },
-        {
-          destinationOwnerAddress: platformTreasuryWalletAddress,
-          amountInUsdcMinor: platformFeeInUsdcMinor,
-        },
-      ],
-    });
+        signature: chainTxSignature,
+        sourceOwnerAddress: payerWalletAddress,
+        recipientTransfers: [
+          {
+            destinationOwnerAddress: recipientWalletAddress,
+            amountInUsdcMinor: sellerNetAmountInUsdcMinor,
+          },
+          {
+            destinationOwnerAddress: platformTreasuryWalletAddress,
+            amountInUsdcMinor: platformFeeInUsdcMinor,
+          },
+        ],
+      });
 
     const grossPurchaseAmountInUsdcMinor =
       sellerNetAmountInUsdcMinor + platformFeeInUsdcMinor;
@@ -375,11 +375,11 @@ export class DirectPaymentService {
               ? PaymentStatus.FAILED
               : PaymentStatus.SUCCEEDED,
             paidAt: isTotalFailure ? null : new Date(),
-          payerWalletAddress,
-          recipientWalletAddress,
-          chainTxSignature: transfer.signature,
-          confirmationSlot: transfer.confirmationSlot ?? undefined,
-          providerPayload: {
+            payerWalletAddress,
+            recipientWalletAddress,
+            chainTxSignature: transfer.signature,
+            confirmationSlot: transfer.confirmationSlot ?? undefined,
+            providerPayload: {
               ...(payment.providerPayload &&
               typeof payment.providerPayload === 'object' &&
               !Array.isArray(payment.providerPayload)
@@ -495,12 +495,10 @@ export class DirectPaymentService {
               idempotencyKey: `sale:${payment.id}:${item.id}`,
               type: LedgerEntryType.SALE_CREDIT,
               amountInUsdcMinor: Math.floor(
-                (item.amountInUsdcMinor * (10_000 - platformFeeBps)) /
-                  10_000,
+                (item.amountInUsdcMinor * (10_000 - platformFeeBps)) / 10_000,
               ),
               availableDeltaInUsdcMinor: Math.floor(
-                (item.amountInUsdcMinor * (10_000 - platformFeeBps)) /
-                  10_000,
+                (item.amountInUsdcMinor * (10_000 - platformFeeBps)) / 10_000,
               ),
               description: `Chapter sale credit for ${item.offer.title}`,
               reference: payment.reference,
@@ -536,8 +534,7 @@ export class DirectPaymentService {
               },
               revenueInUsdcMinor: {
                 increment: Math.floor(
-                  (item.amountInUsdcMinor * (10_000 - platformFeeBps)) /
-                    10_000,
+                  (item.amountInUsdcMinor * (10_000 - platformFeeBps)) / 10_000,
                 ),
               },
             },
@@ -546,8 +543,7 @@ export class DirectPaymentService {
               date: new Date(new Date().toDateString()),
               purchases: 1,
               revenueInUsdcMinor: Math.floor(
-                (item.amountInUsdcMinor * (10_000 - platformFeeBps)) /
-                  10_000,
+                (item.amountInUsdcMinor * (10_000 - platformFeeBps)) / 10_000,
               ),
             },
           });
