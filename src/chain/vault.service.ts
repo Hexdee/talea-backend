@@ -31,8 +31,7 @@ export class VaultService {
 
   private getMasterKey() {
     const configured =
-      this.configService.get<string>('CHAIN_MASTER_KEY')?.trim() ||
-      'lesenpad-dev-chain-master-key';
+      this.configService.getOrThrow<string>('CHAIN_MASTER_KEY');
 
     return createHash('sha256').update(configured).digest();
   }

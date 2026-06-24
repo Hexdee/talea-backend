@@ -6,7 +6,7 @@ Production NestJS API for Lesenpad.
 - Database: PostgreSQL
 - ORM: Prisma
 - Swagger docs: `/docs`
-- Payment provider mode: Solana devnet USDC
+- Payment provider mode: Solana mainnet USDC in production, devnet locally
 
 ## Requirements
 
@@ -52,26 +52,47 @@ Production NestJS API for Lesenpad.
    RISK_DAILY_WITHDRAWAL_LIMIT_USDC_MINOR=500000000
    RISK_PER_MINUTE_REQUEST_LIMIT=20
    RISK_BLOCKED_WALLET_ADDRESSES=
+   RISK_MANUAL_APPROVAL_THRESHOLD_USDC_MINOR=100000000
+   RISK_MAX_SINGLE_WITHDRAWAL_USDC_MINOR=100000000
+   RISK_MAX_REQUESTS_PER_DAY_PER_WALLET=5
+   RISK_MAX_AMOUNT_PER_DAY_PER_WALLET_USDC_MINOR=500000000
+   RISK_MAX_REQUESTS_PER_DAY_GLOBAL=50
+   RISK_MAX_AMOUNT_PER_DAY_GLOBAL_USDC_MINOR=2000000000
    EMAILS_ENABLED=true
    RESEND_API_KEY=re_xxxxxxxxx
    RESEND_FROM_EMAIL=Lesenpad <onboarding@resend.dev>
    CHAIN_MASTER_KEY=replace-with-a-stable-local-secret
+   SOLANA_TREASURY_SECRET_SOURCE=file
    SOLANA_NETWORK=devnet
    SOLANA_RPC_URL=https://api.devnet.solana.com
-   SOLANA_USDC_MINT_ADDRESS=replace-with-devnet-usdc-mint
+   SOLANA_USDC_MINT_ADDRESS=4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU
    SOLANA_TREASURY_SECRET_KEY=replace-with-json-array-or-base64-secret-key
+   SOLANA_TREASURY_SECRET_KEY_FILE=
+   HASHICORP_VAULT_ADDR=
+   HASHICORP_VAULT_NAMESPACE=
+   HASHICORP_VAULT_TOKEN=
+   HASHICORP_VAULT_TOKEN_FILE=
+   HASHICORP_VAULT_SECRET_PATH=
+   HASHICORP_VAULT_SECRET_FIELD=secret
    SOLANA_CONFIRMATION_COMMITMENT=confirmed
    PINATA_JWT=replace-with-pinata-jwt
    IPFS_GATEWAY_BASE=https://gateway.pinata.cloud
    ```
 
-   `SOLANA_TREASURY_SECRET_KEY` must be the fee-paying treasury keypair secret
-   encoded as either a JSON byte array or base64. Keep `CHAIN_MASTER_KEY`
-   stable after publishing encrypted chapters, otherwise old encrypted chapter
-   blobs cannot be decrypted. Public covers/editor media now upload to R2,
-   and both paid encrypted chapter payloads and NFT metadata JSON now upload to
-   Pinata/IPFS. Set `EMAILS_ENABLED=true` and a valid `RESEND_API_KEY` to send
-   transactional emails from signup/purchase/withdraw flows.
+   For local development, `SOLANA_TREASURY_SECRET_KEY` can be a JSON byte array
+   or base64-encoded secret key. In production, you can keep using an env-file
+   or set `SOLANA_TREASURY_SECRET_SOURCE=file` and point
+   `SOLANA_TREASURY_SECRET_KEY_FILE` at the mounted secret. `env` remains
+   available if you are explicitly exporting the secret into the runtime
+   environment. Vault support is still available, but you do not need it for
+   the current setup.
+
+   Keep `CHAIN_MASTER_KEY` stable after publishing encrypted chapters,
+   otherwise old encrypted chapter blobs cannot be decrypted. Public
+   covers/editor media upload to R2, and both paid encrypted chapter payloads
+   and NFT metadata JSON upload to Pinata/IPFS. Set `EMAILS_ENABLED=true` and a
+   valid `RESEND_API_KEY` to send transactional emails from
+   signup/purchase/withdraw flows.
 
 5. Generate the Prisma client:
 
@@ -95,6 +116,12 @@ Production NestJS API for Lesenpad.
 
    ```bash
    pnpm start:dev
+   ```
+
+   Start the reconciliation worker in a second terminal:
+
+   ```bash
+   pnpm start:worker:dev
    ```
 
 9. Open the local services:
@@ -126,9 +153,68 @@ pnpm typecheck
 pnpm build
 ```
 
+## Ops Helpers
+
+- Clear a development or staging database:
+
+  ```bash
+  pnpm db:clear -- --yes
+  ```
+
+- Create a fresh Solana wallet keypair:
+
+  ```bash
+  pnpm wallet:create -- --format base64
+  ```
+
+- Create a JSON secret file for a wallet:
+
+  ```bash
+  pnpm wallet:create -- --format json --out /tmp/solana-wallet.json
+  ```
+
+- Back up the database to Google Drive:
+
+  ```bash
+  pnpm db:backup:drive
+  ```
+
+  Required env:
+
+  ```env
+  GOOGLE_DRIVE_BACKUP_FOLDER_ID=replace-with-drive-folder-id
+  GOOGLE_DRIVE_SERVICE_ACCOUNT_FILE=/path/to/service-account.json
+  ```
+
+  Or:
+
+  ```env
+  GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON={"type":"service_account",...}
+  ```
+
+## Admin controls
+
+- Visit `/admin` as an `ADMIN` or `SUPERADMIN` user to manage:
+  - Featured books
+  - Withdrawal policy thresholds and allowlist
+  - Payout recovery and manual approval
+  - Reconciliation and finance exports
+
+## Mainnet launch notes
+
+- The treasury secret may come from:
+  - `SOLANA_TREASURY_SECRET_KEY` when exporting env vars directly
+  - `SOLANA_TREASURY_SECRET_KEY_FILE` when using a mounted file
+  - Vault, if you decide to turn it back on later
+- The withdrawal policy is persisted in Postgres and should be reviewed
+  before mainnet launch. Default limits are seeded from the risk env values
+  above on first run.
+
 ## Notes
 
 - Google OAuth is wired, but local login works without Google secrets.
 - Existing local `/uploads` assets are still served for backward compatibility,
   but new covers and editor media upload to R2.
 - The frontend repo lives in the sibling folder `/Users/hexdee/projects/new project/talea`.
+- Production should run the API and reconciliation worker as separate
+  always-on processes.

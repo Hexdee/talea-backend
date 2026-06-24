@@ -1,4 +1,9 @@
 import { z } from 'zod';
+import {
+  DEFAULT_DEVNET_SOLANA_RPC_URL,
+  DEVNET_USDC_MINT_ADDRESS,
+  MAINNET_USDC_MINT_ADDRESS,
+} from './solana.constants';
 
 const integerString = z.string().regex(/^\d+$/, 'Must be a number');
 const isTest = process.env.NODE_ENV === 'test';
@@ -6,6 +11,7 @@ const requiredChainSecret = (fallback: string) =>
   isTest ? z.string().default(fallback) : z.string().min(1);
 const requiredStorageSetting = (fallback: string) =>
   isTest ? z.string().default(fallback) : z.string().min(1);
+const mainnetLabels = new Set(['mainnet', 'mainnet-beta']);
 
 export const envSchema = z
   .object({
@@ -40,14 +46,22 @@ export const envSchema = z
     CHAIN_MASTER_KEY: requiredChainSecret('test-chain-master-key'),
     WALLET_PROVIDER: z.enum(['solana', 'circle']).default('solana'),
     SOLANA_NETWORK: z.string().default('devnet'),
-    SOLANA_RPC_URL: z.string().default('https://api.devnet.solana.com'),
-    SOLANA_USDC_MINT_ADDRESS: requiredChainSecret(
-      'So11111111111111111111111111111111111111112',
-    ),
-    SOLANA_TREASURY_SECRET_KEY: requiredChainSecret('test-secret-key'),
+    SOLANA_RPC_URL: z.string().default(DEFAULT_DEVNET_SOLANA_RPC_URL),
+    SOLANA_USDC_MINT_ADDRESS: requiredChainSecret(DEVNET_USDC_MINT_ADDRESS),
+    SOLANA_TREASURY_SECRET_SOURCE: z
+      .enum(['env', 'file', 'vault'])
+      .default('file'),
+    SOLANA_TREASURY_SECRET_KEY: z.string().optional(),
+    SOLANA_TREASURY_SECRET_KEY_FILE: z.string().optional(),
     SOLANA_CONFIRMATION_COMMITMENT: z
       .enum(['processed', 'confirmed', 'finalized'])
       .default('confirmed'),
+    HASHICORP_VAULT_ADDR: z.string().optional(),
+    HASHICORP_VAULT_NAMESPACE: z.string().optional(),
+    HASHICORP_VAULT_TOKEN: z.string().optional(),
+    HASHICORP_VAULT_TOKEN_FILE: z.string().optional(),
+    HASHICORP_VAULT_SECRET_PATH: z.string().optional(),
+    HASHICORP_VAULT_SECRET_FIELD: z.string().default('secret'),
     PINATA_JWT: requiredChainSecret('test-pinata-jwt'),
     IPFS_GATEWAY_BASE: z.string().optional(),
     COINGECKO_API_BASE: z.string().default('https://api.coingecko.com/api/v3'),
@@ -56,6 +70,12 @@ export const envSchema = z
     RISK_DAILY_WITHDRAWAL_LIMIT_USDC_MINOR: integerString.default('500000000'),
     RISK_PER_MINUTE_REQUEST_LIMIT: integerString.default('20'),
     RISK_BLOCKED_WALLET_ADDRESSES: z.string().default(''),
+    RISK_MANUAL_APPROVAL_THRESHOLD_USDC_MINOR: integerString.default('100000000'),
+    RISK_MAX_SINGLE_WITHDRAWAL_USDC_MINOR: integerString.default('100000000'),
+    RISK_MAX_REQUESTS_PER_DAY_PER_WALLET: integerString.default('5'),
+    RISK_MAX_AMOUNT_PER_DAY_PER_WALLET_USDC_MINOR: integerString.default('500000000'),
+    RISK_MAX_REQUESTS_PER_DAY_GLOBAL: integerString.default('50'),
+    RISK_MAX_AMOUNT_PER_DAY_GLOBAL_USDC_MINOR: integerString.default('2000000000'),
     EMAILS_ENABLED: z.enum(['true', 'false']).default('false'),
     RESEND_API_KEY: z.string().optional(),
     RESEND_FROM_EMAIL: z.string().default('Lesenpad <onboarding@resend.dev>'),
@@ -65,6 +85,87 @@ export const envSchema = z
     GOOGLE_CALLBACK_URL: z.string().optional(),
   })
   .superRefine((config, ctx) => {
+    if (
+      config.NODE_ENV === 'production' &&
+      !mainnetLabels.has(config.SOLANA_NETWORK)
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['SOLANA_NETWORK'],
+        message:
+          'SOLANA_NETWORK must be mainnet or mainnet-beta in production.',
+      });
+    }
+
+    if (
+      config.NODE_ENV === 'production' &&
+      config.SOLANA_RPC_URL.includes('devnet')
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['SOLANA_RPC_URL'],
+        message:
+          'SOLANA_RPC_URL must point to a mainnet RPC endpoint in production.',
+      });
+    }
+
+    if (
+      config.NODE_ENV === 'production' &&
+      config.SOLANA_USDC_MINT_ADDRESS !== MAINNET_USDC_MINT_ADDRESS
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['SOLANA_USDC_MINT_ADDRESS'],
+        message:
+          'SOLANA_USDC_MINT_ADDRESS must be the mainnet USDC mint in production.',
+      });
+    }
+
+    if (
+      config.NODE_ENV === 'production' &&
+      config.SOLANA_TREASURY_SECRET_SOURCE === 'file' &&
+      !config.SOLANA_TREASURY_SECRET_KEY_FILE?.trim()
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['SOLANA_TREASURY_SECRET_KEY_FILE'],
+        message:
+          'SOLANA_TREASURY_SECRET_KEY_FILE is required in production when using file-based treasury secrets.',
+      });
+    }
+
+    if (
+      config.NODE_ENV === 'production' &&
+      config.SOLANA_TREASURY_SECRET_SOURCE === 'vault'
+    ) {
+      if (!config.HASHICORP_VAULT_ADDR?.trim()) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['HASHICORP_VAULT_ADDR'],
+          message: 'HASHICORP_VAULT_ADDR is required when using vault secrets.',
+        });
+      }
+      if (
+        !config.HASHICORP_VAULT_TOKEN?.trim() &&
+        !config.HASHICORP_VAULT_TOKEN_FILE?.trim()
+      ) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['HASHICORP_VAULT_TOKEN'],
+          message:
+            'Set HASHICORP_VAULT_TOKEN or HASHICORP_VAULT_TOKEN_FILE when using vault secrets.',
+        });
+      }
+      if (!config.HASHICORP_VAULT_SECRET_PATH?.trim()) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['HASHICORP_VAULT_SECRET_PATH'],
+          message:
+            'HASHICORP_VAULT_SECRET_PATH is required when using vault secrets.',
+        });
+      }
+    }
+
     if (config.EMAILS_ENABLED === 'true' && !config.RESEND_API_KEY?.trim()) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,

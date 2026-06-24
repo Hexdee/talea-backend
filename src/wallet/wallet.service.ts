@@ -20,6 +20,8 @@ import { formatCurrency } from '../common/utils/currency';
 import { EmailsService } from '../emails/emails.service';
 import { LedgerService } from '../ledger/ledger.service';
 import { PrismaService } from '../prisma/prisma.service';
+import { SolanaService } from '../chain/solana.service';
+import { WithdrawalPolicyService } from '../withdrawal-policy/withdrawal-policy.service';
 import {
   CreatePayoutAccountDto,
   CreatePayoutRequestDto,
@@ -34,6 +36,8 @@ export class WalletService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly configService: ConfigService,
+    private readonly solanaService: SolanaService,
+    private readonly withdrawalPolicyService: WithdrawalPolicyService,
     @Inject(WALLET_PROVIDER)
     private readonly walletProvider: WalletProvider,
     private readonly ledgerService: LedgerService,
@@ -528,9 +532,420 @@ export class WalletService {
     });
   }
 
+  private async finalizeRecoveredWithdrawal(input: {
+    requestId: string;
+    userId: string;
+    amountInUsdcMinor: number;
+    signature: string;
+    slot: number | null;
+    blockTime: Date | null;
+    feeInLamports: number;
+    walletAddress?: string | null;
+  }) {
+    await this.prisma.$transaction(async (tx) => {
+      await this.ledgerService.postEntry(
+        {
+          userId: input.userId,
+          idempotencyKey: `withdraw:debit:${input.requestId}`,
+          type: LedgerEntryType.WITHDRAWAL_DEBIT,
+          amountInUsdcMinor: -input.amountInUsdcMinor,
+          availableDeltaInUsdcMinor: -input.amountInUsdcMinor,
+          description: 'External Solana withdrawal debited',
+          reference: input.signature,
+          mirrorWalletTransactionType: WalletTransactionType.PAYOUT_COMPLETED,
+        },
+        tx,
+      );
+
+      await tx.payoutRequest.update({
+        where: { id: input.requestId },
+        data: {
+          status: PayoutRequestStatus.PAID,
+          processedAt: new Date(),
+          externalReference: input.signature,
+          deadLetterReason: null,
+        },
+      });
+
+      await tx.onchainTransaction.upsert({
+        where: {
+          signature: input.signature,
+        },
+        update: {
+          status: OnchainTransactionStatus.CONFIRMED,
+          txType: OnchainTransactionType.USDC_TRANSFER,
+          payoutRequestId: input.requestId,
+          userId: input.userId,
+        },
+        create: {
+          signature: input.signature,
+          network: this.configService.get<string>('SOLANA_NETWORK', 'devnet'),
+          txType: OnchainTransactionType.USDC_TRANSFER,
+          status: OnchainTransactionStatus.CONFIRMED,
+          slot: input.slot ?? undefined,
+          blockTime: input.blockTime ?? undefined,
+          confirmationCommitment: this.configService.get<string>(
+            'SOLANA_CONFIRMATION_COMMITMENT',
+            'confirmed',
+          ),
+          metadataJson: {
+            purpose: 'external_wallet_withdrawal',
+            destinationWalletAddress: input.walletAddress,
+            feeInLamports: input.feeInLamports,
+          },
+          userId: input.userId,
+          payoutRequestId: input.requestId,
+        },
+      });
+    });
+
+    return {
+      success: true,
+      signature: input.signature,
+    };
+  }
+
+  async recoverPayoutRequest(payoutRequestId: string) {
+    const payout = await this.prisma.payoutRequest.findUnique({
+      where: { id: payoutRequestId },
+      include: {
+        user: true,
+        payoutAccount: true,
+      },
+    });
+
+    if (!payout) {
+      return { success: false, message: 'Payout request not found.' };
+    }
+
+    if (payout.status === PayoutRequestStatus.PAID) {
+      return { success: true, message: 'Payout already completed.' };
+    }
+
+    if (
+      payout.payoutAccount?.destinationType !==
+      WithdrawalDestinationType.SOLANA_WALLET
+    ) {
+      return {
+        success: false,
+        message: 'Only Solana wallet payouts can be chain-recovered.',
+      };
+    }
+
+    const payoutAccount = payout.payoutAccount!;
+    const walletAddress = payoutAccount.walletAddress;
+    if (!walletAddress) {
+      return {
+        success: false,
+        message: 'Withdrawal destination is missing a Solana wallet address.',
+      };
+    }
+
+    await this.prisma.payoutRequest.update({
+      where: { id: payout.id },
+      data: {
+        status: PayoutRequestStatus.REVIEWING,
+        retryCount: {
+          increment: 1,
+        },
+        lastRetryAt: new Date(),
+        deadLetterReason: null,
+      },
+    });
+
+    if (payout.externalReference) {
+      const status = await this.solanaService.getTransactionStatus(
+        payout.externalReference,
+      );
+      if (status.exists) {
+        return this.finalizeRecoveredWithdrawal({
+          requestId: payout.id,
+          userId: payout.userId,
+          amountInUsdcMinor: payout.amountInUsdcMinor,
+          signature: payout.externalReference,
+          slot: status.slot,
+          blockTime: status.blockTime,
+          feeInLamports: status.feeInLamports,
+          walletAddress,
+        });
+      }
+    }
+
+    const treasuryAddress = await this.solanaService.getTreasuryAddress();
+    const matched = await this.solanaService.findRecentUsdcWithdrawalTransfer({
+      sourceOwnerAddress: treasuryAddress,
+      destinationOwnerAddress: walletAddress,
+      amountInUsdcMinor: payout.amountInUsdcMinor,
+      limit: 25,
+    });
+
+    if (matched) {
+      return this.finalizeRecoveredWithdrawal({
+        requestId: payout.id,
+        userId: payout.userId,
+        amountInUsdcMinor: payout.amountInUsdcMinor,
+        signature: matched.signature,
+        slot: matched.confirmationSlot,
+        blockTime: matched.blockTime,
+        feeInLamports: matched.feeInLamports,
+        walletAddress,
+      });
+    }
+
+    return {
+      success: false,
+      message:
+        'No matching onchain withdrawal was found yet. Leave the request in REVIEWING and retry later.',
+    };
+  }
+
+  private async releaseWithdrawalHold(input: {
+    userId: string;
+    requestId: string;
+    amountInUsdcMinor: number;
+    reason: string;
+    txClient?: Parameters<LedgerService['postEntry']>[1];
+  }) {
+    const post = async (tx: NonNullable<typeof input.txClient>) =>
+      this.ledgerService.postEntry(
+        {
+          userId: input.userId,
+          idempotencyKey: `withdraw:release:${input.requestId}`,
+          type: LedgerEntryType.WITHDRAWAL_RELEASE,
+          amountInUsdcMinor: input.amountInUsdcMinor,
+          availableDeltaInUsdcMinor: input.amountInUsdcMinor,
+          pendingDeltaInUsdcMinor: -input.amountInUsdcMinor,
+          description: 'Withdrawal hold released',
+          reference: input.requestId,
+          mirrorWalletTransactionType: WalletTransactionType.ADJUSTMENT,
+          metadataJson: {
+            failureReason: input.reason,
+          },
+        },
+        tx,
+      );
+
+    if (input.txClient) {
+      return post(input.txClient);
+    }
+
+    return this.prisma.$transaction((tx) => post(tx));
+  }
+
+  private async processPayoutExecution(payoutRequestId: string) {
+    const payout = await this.prisma.payoutRequest.findUnique({
+      where: { id: payoutRequestId },
+      include: {
+        user: true,
+        payoutAccount: true,
+      },
+    });
+
+    if (!payout) {
+      throw new NotFoundException('Payout request not found.');
+    }
+
+    if (payout.status === PayoutRequestStatus.PAID) {
+      return {
+        success: true,
+        message: 'Payout already completed.',
+      };
+    }
+
+    if (
+      payout.payoutAccount?.destinationType !==
+      WithdrawalDestinationType.SOLANA_WALLET
+    ) {
+      throw new BadRequestException(
+        'Only Solana wallet payouts can be processed automatically.',
+      );
+    }
+
+    const walletAddress = payout.payoutAccount.walletAddress;
+    if (!walletAddress) {
+      throw new BadRequestException(
+        'Solana wallet withdrawal destination is missing an address.',
+      );
+    }
+    const payoutAccount = payout.payoutAccount;
+
+    const user = payout.user;
+    let transfer: Awaited<ReturnType<WalletProvider['signTransfer']>> | null =
+      null;
+    let sponsoredGas: Awaited<
+      ReturnType<WalletProvider['sponsorGas']>
+    > | null = null;
+
+    try {
+      transfer = await this.walletProvider.signTransfer({
+        direction: 'TREASURY_TO_EXTERNAL',
+        destinationWalletAddress: walletAddress,
+        amountInUsdcMinor: payout.amountInUsdcMinor,
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Unknown error';
+      await this.prisma.$transaction(async (tx) => {
+        await this.releaseWithdrawalHold({
+          userId: payout.userId,
+          requestId: payout.id,
+          amountInUsdcMinor: payout.amountInUsdcMinor,
+          reason: message,
+          txClient: tx,
+        });
+        await tx.payoutRequest.update({
+          where: { id: payout.id },
+          data: {
+            status: PayoutRequestStatus.DEAD_LETTER,
+            processedAt: new Date(),
+            deadLetterReason: message,
+          },
+        });
+      });
+
+      throw error;
+    }
+
+    try {
+      sponsoredGas = await this.walletProvider.sponsorGas({
+        txSignature: transfer.signature,
+      });
+    } catch (error) {
+      this.logger.warn(
+        `Withdrawal gas sponsorship/quote failed for request ${payout.id}: ${
+          error instanceof Error ? error.message : 'Unknown error'
+        }. Continuing without charging gas.`,
+      );
+      sponsoredGas = null;
+    }
+
+    if (!transfer) {
+      throw new Error('Withdrawal transfer missing.');
+    }
+    const transferSignature = transfer.signature;
+
+    try {
+      await this.prisma.$transaction(async (tx) => {
+        await this.ledgerService.postEntry(
+          {
+            userId: payout.userId,
+            idempotencyKey: `withdraw:debit:${payout.id}`,
+            type: LedgerEntryType.WITHDRAWAL_DEBIT,
+            amountInUsdcMinor: -payout.amountInUsdcMinor,
+            availableDeltaInUsdcMinor: 0,
+            pendingDeltaInUsdcMinor: -payout.amountInUsdcMinor,
+            description: 'External Solana withdrawal debited',
+            reference: transferSignature,
+            mirrorWalletTransactionType:
+              WalletTransactionType.PAYOUT_COMPLETED,
+          },
+          tx,
+        );
+
+        if (sponsoredGas?.feeInUsdcMinor) {
+          await this.ledgerService.postEntry(
+            {
+              userId: payout.userId,
+              idempotencyKey: `gas:withdraw:${payout.id}`,
+              type: LedgerEntryType.GAS_FEE_DEBIT,
+              amountInUsdcMinor: -sponsoredGas.feeInUsdcMinor,
+              availableDeltaInUsdcMinor: -sponsoredGas.feeInUsdcMinor,
+              description: 'Treasury-sponsored gas fee charged',
+              reference: transferSignature,
+              metadataJson: {
+                feeInLamports: sponsoredGas.feeInLamports,
+                solUsdPrice: sponsoredGas.solUsdPrice,
+              },
+              mirrorWalletTransactionType: WalletTransactionType.GAS_FEE,
+            },
+            tx,
+          );
+        }
+
+        await tx.payoutRequest.update({
+          where: { id: payout.id },
+          data: {
+            status: PayoutRequestStatus.PAID,
+            processedAt: new Date(),
+            externalReference: transferSignature,
+            deadLetterReason: null,
+          },
+        });
+
+        await tx.onchainTransaction.upsert({
+          where: {
+            signature: transferSignature,
+          },
+          update: {
+            status: OnchainTransactionStatus.CONFIRMED,
+            txType: OnchainTransactionType.USDC_TRANSFER,
+          },
+          create: {
+            signature: transferSignature,
+            network: this.configService.get<string>('SOLANA_NETWORK', 'devnet'),
+            txType: OnchainTransactionType.USDC_TRANSFER,
+            status: OnchainTransactionStatus.CONFIRMED,
+            slot: transfer.confirmationSlot ?? undefined,
+            blockTime: transfer.blockTime ?? undefined,
+            confirmationCommitment: this.configService.get<string>(
+              'SOLANA_CONFIRMATION_COMMITMENT',
+              'confirmed',
+            ),
+            metadataJson: {
+              purpose: 'external_wallet_withdrawal',
+              sourceTokenAccountAddress: transfer.sourceTokenAccountAddress,
+              destinationTokenAccountAddress:
+                transfer.destinationTokenAccountAddress,
+              destinationWalletAddress: walletAddress,
+              feeInLamports:
+                sponsoredGas?.feeInLamports ?? transfer.feeInLamports,
+              feeInUsdcMinor: sponsoredGas?.feeInUsdcMinor ?? null,
+              solUsdPrice: sponsoredGas?.solUsdPrice ?? null,
+            },
+            userId: payout.userId,
+            payoutRequestId: payout.id,
+          },
+        });
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Unknown error';
+      await this.prisma.$transaction(async (tx) => {
+        await this.releaseWithdrawalHold({
+          userId: payout.userId,
+          requestId: payout.id,
+          amountInUsdcMinor: payout.amountInUsdcMinor,
+          reason: message,
+          txClient: tx,
+        });
+        await tx.payoutRequest.update({
+          where: { id: payout.id },
+          data: {
+            status: PayoutRequestStatus.DEAD_LETTER,
+            processedAt: new Date(),
+            externalReference: transferSignature,
+            deadLetterReason: message,
+          },
+        });
+      });
+
+      throw error;
+    }
+
+    await this.emailsService.sendWithdrawalCompletedEmail({
+      to: user.email,
+      displayName: user.displayName,
+      amountFormatted: formatCurrency(payout.amountInUsdcMinor, 'USDC'),
+      destinationLabel: payoutAccount.label,
+      reference: transferSignature,
+    });
+
+    return {
+      success: true,
+      signature: transferSignature,
+    };
+  }
+
   async createPayoutRequest(userId: string, dto: CreatePayoutRequestDto) {
     await this.enforceVelocity(userId, 'create payout request');
-    await this.enforceDailyWithdrawalLimit(userId, dto.amountInUsdcMinor);
 
     const user = await this.getUserOrThrow(userId);
     const wallet = await this.prisma.wallet.findUnique({
@@ -570,6 +985,13 @@ export class WalletService {
         );
       }
 
+      const policyDecision =
+        await this.withdrawalPolicyService.assertWithdrawalAllowed({
+          userId,
+          amountInUsdcMinor: dto.amountInUsdcMinor,
+          destinationWalletAddress: payoutAccount.walletAddress,
+        });
+
       const request = await this.prisma.$transaction(async (tx) => {
         const request = await tx.payoutRequest.create({
           data: {
@@ -577,6 +999,9 @@ export class WalletService {
             payoutAccountId: payoutAccount.id,
             amountInUsdcMinor: dto.amountInUsdcMinor,
             status: 'REVIEWING',
+            notes: policyDecision.requiresManualReview
+              ? 'Manual approval required by withdrawal policy.'
+              : null,
           },
         });
 
@@ -599,184 +1024,27 @@ export class WalletService {
         return request;
       });
 
-      let transfer: Awaited<ReturnType<WalletProvider['signTransfer']>> | null =
-        null;
-      let sponsoredGas: Awaited<
-        ReturnType<WalletProvider['sponsorGas']>
-      > | null = null;
-
-      try {
-        transfer = await this.walletProvider.signTransfer({
-          direction: 'TREASURY_TO_EXTERNAL',
-          destinationWalletAddress: payoutAccount.walletAddress,
-          amountInUsdcMinor: dto.amountInUsdcMinor,
-        });
-      } catch (error) {
-        const message =
-          error instanceof Error ? error.message : 'Unknown error';
-        await this.prisma.$transaction(async (tx) => {
-          await this.ledgerService.postEntry(
-            {
-              userId,
-              idempotencyKey: `withdraw:release:${request.id}`,
-              type: LedgerEntryType.WITHDRAWAL_RELEASE,
-              amountInUsdcMinor: dto.amountInUsdcMinor,
-              availableDeltaInUsdcMinor: dto.amountInUsdcMinor,
-              pendingDeltaInUsdcMinor: -dto.amountInUsdcMinor,
-              description: 'Withdrawal hold released',
-              reference: request.id,
-              mirrorWalletTransactionType: WalletTransactionType.ADJUSTMENT,
-              metadataJson: {
-                failureReason: message,
-              },
-            },
-            tx,
-          );
-
-          await tx.payoutRequest.update({
-            where: { id: request.id },
-            data: {
-              status: PayoutRequestStatus.DEAD_LETTER,
-              processedAt: new Date(),
-              deadLetterReason: message,
-            },
-          });
-        });
-
-        throw error;
-      }
-
-      try {
-        sponsoredGas = await this.walletProvider.sponsorGas({
-          txSignature: transfer.signature,
-        });
-      } catch (error) {
-        this.logger.warn(
-          `Withdrawal gas sponsorship/quote failed for request ${request.id}: ${
-            error instanceof Error ? error.message : 'Unknown error'
-          }. Continuing without charging gas.`,
-        );
-        sponsoredGas = null;
-      }
-
-      if (!transfer) {
-        throw new Error('Withdrawal transfer missing.');
-      }
-
-      try {
-        await this.prisma.$transaction(async (tx) => {
-          await this.ledgerService.postEntry(
-            {
-              userId,
-              idempotencyKey: `withdraw:debit:${request.id}`,
-              type: LedgerEntryType.WITHDRAWAL_DEBIT,
-              amountInUsdcMinor: -dto.amountInUsdcMinor,
-              availableDeltaInUsdcMinor: 0,
-              pendingDeltaInUsdcMinor: -dto.amountInUsdcMinor,
-              description: 'External Solana withdrawal debited',
-              reference: transfer.signature,
-              mirrorWalletTransactionType:
-                WalletTransactionType.PAYOUT_COMPLETED,
-            },
-            tx,
-          );
-
-          if (sponsoredGas?.feeInUsdcMinor) {
-            await this.ledgerService.postEntry(
-              {
-                userId,
-                idempotencyKey: `gas:withdraw:${request.id}`,
-                type: LedgerEntryType.GAS_FEE_DEBIT,
-                amountInUsdcMinor: -sponsoredGas.feeInUsdcMinor,
-                availableDeltaInUsdcMinor: -sponsoredGas.feeInUsdcMinor,
-                description: 'Treasury-sponsored gas fee charged',
-                reference: transfer.signature,
-                metadataJson: {
-                  feeInLamports: sponsoredGas.feeInLamports,
-                  solUsdPrice: sponsoredGas.solUsdPrice,
-                },
-                mirrorWalletTransactionType: WalletTransactionType.GAS_FEE,
-              },
-              tx,
-            );
-          }
-
-          await tx.payoutRequest.update({
-            where: { id: request.id },
-            data: {
-              status: 'PAID',
-              processedAt: new Date(),
-              externalReference: transfer.signature,
-              deadLetterReason: null,
-            },
-          });
-
-          await tx.onchainTransaction.upsert({
-            where: {
-              signature: transfer.signature,
-            },
-            update: {
-              status: OnchainTransactionStatus.CONFIRMED,
-              txType: OnchainTransactionType.USDC_TRANSFER,
-            },
-            create: {
-              signature: transfer.signature,
-              network: this.configService.get<string>(
-                'SOLANA_NETWORK',
-                'devnet',
-              ),
-              txType: OnchainTransactionType.USDC_TRANSFER,
-              status: OnchainTransactionStatus.CONFIRMED,
-              slot: transfer.confirmationSlot ?? undefined,
-              blockTime: transfer.blockTime ?? undefined,
-              confirmationCommitment: this.configService.get<string>(
-                'SOLANA_CONFIRMATION_COMMITMENT',
-                'confirmed',
-              ),
-              metadataJson: {
-                purpose: 'external_wallet_withdrawal',
-                sourceTokenAccountAddress: transfer.sourceTokenAccountAddress,
-                destinationTokenAccountAddress:
-                  transfer.destinationTokenAccountAddress,
-                destinationWalletAddress: payoutAccount.walletAddress,
-                feeInLamports:
-                  sponsoredGas?.feeInLamports ?? transfer.feeInLamports,
-                feeInUsdcMinor: sponsoredGas?.feeInUsdcMinor ?? null,
-                solUsdPrice: sponsoredGas?.solUsdPrice ?? null,
-              },
-              userId,
-              payoutRequestId: request.id,
-            },
-          });
-        });
-      } catch (error) {
-        const message =
-          error instanceof Error ? error.message : 'Unknown error';
-        await this.prisma.payoutRequest.update({
-          where: { id: request.id },
-          data: {
-            status: PayoutRequestStatus.DEAD_LETTER,
-            processedAt: new Date(),
-            externalReference: transfer.signature,
-            deadLetterReason: message,
-          },
-        });
-
-        throw error;
-      }
-
-      await this.emailsService.sendWithdrawalCompletedEmail({
+      await this.emailsService.sendWithdrawalRequestedEmail({
         to: user.email,
         displayName: user.displayName,
         amountFormatted: formatCurrency(dto.amountInUsdcMinor, 'USDC'),
         destinationLabel: payoutAccount.label,
-        reference: transfer.signature,
+        requestId: request.id,
       });
 
+      if (policyDecision.requiresManualReview) {
+        return {
+          id: request.id,
+          status: PayoutRequestStatus.REVIEWING,
+          reference: null,
+        };
+      }
+
+      const result = await this.processPayoutExecution(request.id);
       return {
         id: request.id,
         status: PayoutRequestStatus.PAID,
-        reference: transfer.signature,
+        reference: result.signature,
       };
     }
 
@@ -785,6 +1053,71 @@ export class WalletService {
     }
 
     throw new BadRequestException('Unsupported withdrawal destination.');
+  }
+
+  async approvePayoutRequest(payoutRequestId: string) {
+    const payout = await this.prisma.payoutRequest.findUnique({
+      where: { id: payoutRequestId },
+    });
+
+    if (!payout) {
+      return { success: false, message: 'Payout request not found.' };
+    }
+
+    if (payout.status === PayoutRequestStatus.PAID) {
+      return { success: true, message: 'Payout already completed.' };
+    }
+
+    await this.prisma.payoutRequest.update({
+      where: { id: payoutRequestId },
+      data: {
+        status: PayoutRequestStatus.APPROVED,
+        deadLetterReason: null,
+      },
+    });
+
+    return this.processPayoutExecution(payoutRequestId);
+  }
+
+  async rejectPayoutRequest(payoutRequestId: string, reason: string) {
+    const payout = await this.prisma.payoutRequest.findUnique({
+      where: { id: payoutRequestId },
+      include: {
+        user: true,
+      },
+    });
+
+    if (!payout) {
+      return { success: false, message: 'Payout request not found.' };
+    }
+
+    if (payout.status === PayoutRequestStatus.PAID) {
+      return { success: false, message: 'Completed payouts cannot be rejected.' };
+    }
+
+    if (
+      payout.status === PayoutRequestStatus.REQUESTED ||
+      payout.status === PayoutRequestStatus.REVIEWING ||
+      payout.status === PayoutRequestStatus.APPROVED
+    ) {
+      await this.releaseWithdrawalHold({
+        userId: payout.userId,
+        requestId: payout.id,
+        amountInUsdcMinor: payout.amountInUsdcMinor,
+        reason,
+      });
+    }
+
+    await this.prisma.payoutRequest.update({
+      where: { id: payout.id },
+      data: {
+        status: PayoutRequestStatus.REJECTED,
+        processedAt: new Date(),
+        deadLetterReason: reason,
+      },
+    });
+
+    return { success: true, message: 'Payout rejected.' };
   }
 
   async refreshDeposits(userId: string) {
@@ -916,11 +1249,42 @@ export class WalletService {
     };
   }
 
-  async reconcilePendingOfframps() {
-    return {
-      scanned: 0,
-      retried: 0,
-      deadLettered: 0,
-    };
+  reconcilePendingOfframps(): Promise<{
+    scanned: number;
+    retried: number;
+    deadLettered: number;
+  }> {
+    return this.prisma.payoutRequest
+      .findMany({
+        where: {
+          status: {
+            in: [
+              PayoutRequestStatus.REVIEWING,
+              PayoutRequestStatus.DEAD_LETTER,
+            ],
+          },
+        },
+        orderBy: { requestedAt: 'asc' },
+        take: 25,
+      })
+      .then(async (requests) => {
+        let retried = 0;
+        let deadLettered = 0;
+
+        for (const request of requests) {
+          const result = await this.recoverPayoutRequest(request.id);
+          if (result.success) {
+            retried += 1;
+          } else if (request.status === PayoutRequestStatus.DEAD_LETTER) {
+            deadLettered += 1;
+          }
+        }
+
+        return {
+          scanned: requests.length,
+          retried,
+          deadLettered,
+        };
+      });
   }
 }

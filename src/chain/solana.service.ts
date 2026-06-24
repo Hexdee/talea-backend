@@ -52,6 +52,7 @@ import {
   toWeb3JsPublicKey,
 } from '@metaplex-foundation/umi-web3js-adapters';
 import { VaultService } from './vault.service';
+import { TreasurySecretService } from './treasury-secret.service';
 
 type CreatedWallet = {
   address: string;
@@ -143,6 +144,7 @@ export class SolanaService {
   constructor(
     private readonly configService: ConfigService,
     private readonly vaultService: VaultService,
+    private readonly treasurySecretService: TreasurySecretService,
   ) {
     this.connection = new Connection(
       this.configService.getOrThrow<string>('SOLANA_RPC_URL'),
@@ -177,20 +179,27 @@ export class SolanaService {
       return new PublicKey(mint);
     } catch (error) {
       throw new ServiceUnavailableException(
-        'SOLANA_USDC_MINT_ADDRESS is invalid. Configure a valid devnet USDC mint address.',
+        'SOLANA_USDC_MINT_ADDRESS is invalid. Configure a valid USDC mint address for the active cluster.',
         { cause: error },
       );
     }
   }
 
-  private getTreasuryKeypair() {
-    const secret = this.configService.getOrThrow<string>(
-      'SOLANA_TREASURY_SECRET_KEY',
-    );
+  private async getTreasurySecretMaterial() {
+    return this.treasurySecretService.getTreasurySecretMaterial();
+  }
 
+  private async getTreasuryKeypair() {
     return Keypair.fromSecretKey(
-      parseSecretKey(secret, 'SOLANA_TREASURY_SECRET_KEY'),
+      parseSecretKey(
+        await this.getTreasurySecretMaterial(),
+        'SOLANA_TREASURY_SECRET_KEY',
+      ),
     );
+  }
+
+  async getTreasuryAddress() {
+    return (await this.getTreasuryKeypair()).publicKey.toBase58();
   }
 
   private decryptCustodialKeypair(encryptedPrivateKey: string) {
@@ -220,8 +229,22 @@ export class SolanaService {
     return meta.feeInLamports;
   }
 
-  private createUmiWithTreasury() {
-    const treasury = this.getTreasuryKeypair();
+  async getTransactionStatus(signature: string) {
+    const tx = await this.connection.getTransaction(signature, {
+      commitment: this.getFinalityCommitment(),
+      maxSupportedTransactionVersion: 0,
+    });
+
+    return {
+      exists: Boolean(tx),
+      slot: tx?.slot ?? null,
+      blockTime: tx?.blockTime ? new Date(tx.blockTime * 1000) : null,
+      feeInLamports: tx?.meta?.fee ?? 0,
+    };
+  }
+
+  private async createUmiWithTreasury() {
+    const treasury = await this.getTreasuryKeypair();
     const umi = createUmi(this.connection.rpcEndpoint).use(mplTokenMetadata());
 
     umi.use(keypairIdentity(fromWeb3JsKeypair(treasury)));
@@ -229,8 +252,8 @@ export class SolanaService {
     return { treasury, umi };
   }
 
-  private createUmiWithTreasuryPayer(identity?: Keypair) {
-    const treasury = this.getTreasuryKeypair();
+  private async createUmiWithTreasuryPayer(identity?: Keypair) {
+    const treasury = await this.getTreasuryKeypair();
     const umi = createUmi(this.connection.rpcEndpoint).use(mplTokenMetadata());
     const effectiveIdentity = identity ?? treasury;
 
@@ -292,7 +315,6 @@ export class SolanaService {
     const intervalMs = input.intervalMs ?? 1_000;
     const startedAt = Date.now();
 
-    // eslint-disable-next-line no-constant-condition
     while (true) {
       const info = await this.connection.getAccountInfo(
         new PublicKey(input.address),
@@ -341,7 +363,7 @@ export class SolanaService {
           )
         ) {
           throw new ServiceUnavailableException(
-            `${context} failed because the fee payer account is unfunded or does not exist on-chain. Ensure SOLANA_TREASURY_SECRET_KEY points to a funded wallet on ${this.getNetwork()} (pubkey: ${this.getTreasuryKeypair().publicKey.toBase58()}).`,
+            `${context} failed because the fee payer account is unfunded or does not exist on-chain. Ensure the treasury secret points to a funded wallet on ${this.getNetwork()}.`,
           );
         }
         if (
@@ -513,6 +535,100 @@ export class SolanaService {
     };
   }
 
+  async findRecentUsdcWithdrawalTransfer(input: {
+    sourceOwnerAddress: string;
+    destinationOwnerAddress: string;
+    amountInUsdcMinor: number;
+    limit?: number;
+  }) {
+    const mint = this.getUsdcMintAddress();
+    const sourceOwner = input.sourceOwnerAddress;
+    const destinationOwner = input.destinationOwnerAddress;
+    const sourceTokenAccount = await getAssociatedTokenAddress(
+      this.getUsdcMint(),
+      new PublicKey(sourceOwner),
+    );
+    const destinationTokenAccount = await getAssociatedTokenAddress(
+      this.getUsdcMint(),
+      new PublicKey(destinationOwner),
+    );
+    const signatures = await this.connection.getSignaturesForAddress(
+      sourceTokenAccount,
+      { limit: input.limit ?? 25 },
+      this.getFinalityCommitment(),
+    );
+
+    for (const item of signatures) {
+      const transaction = await this.connection.getParsedTransaction(
+        item.signature,
+        {
+          commitment: this.getFinalityCommitment(),
+          maxSupportedTransactionVersion: 0,
+        },
+      );
+
+      if (!transaction?.meta) {
+        continue;
+      }
+
+      const pre = transaction.meta.preTokenBalances ?? [];
+      const post = transaction.meta.postTokenBalances ?? [];
+      const sourceBefore = pre
+        .filter(
+          (balance) => balance.owner === sourceOwner && balance.mint === mint,
+        )
+        .reduce(
+          (sum, balance) => sum + BigInt(balance.uiTokenAmount.amount),
+          0n,
+        );
+      const sourceAfter = post
+        .filter(
+          (balance) => balance.owner === sourceOwner && balance.mint === mint,
+        )
+        .reduce(
+          (sum, balance) => sum + BigInt(balance.uiTokenAmount.amount),
+          0n,
+        );
+      const destinationBefore = pre
+        .filter(
+          (balance) =>
+            balance.owner === destinationOwner && balance.mint === mint,
+        )
+        .reduce(
+          (sum, balance) => sum + BigInt(balance.uiTokenAmount.amount),
+          0n,
+        );
+      const destinationAfter = post
+        .filter(
+          (balance) =>
+            balance.owner === destinationOwner && balance.mint === mint,
+        )
+        .reduce(
+          (sum, balance) => sum + BigInt(balance.uiTokenAmount.amount),
+          0n,
+        );
+
+      const expected = BigInt(input.amountInUsdcMinor);
+      if (
+        sourceBefore - sourceAfter === expected &&
+        destinationAfter - destinationBefore === expected
+      ) {
+        return {
+          signature: item.signature,
+          sourceTokenAccountAddress: sourceTokenAccount.toBase58(),
+          destinationTokenAccountAddress: destinationTokenAccount.toBase58(),
+          confirmationSlot: transaction.slot,
+          blockTime: transaction.blockTime
+            ? new Date(transaction.blockTime * 1000)
+            : null,
+          feeInLamports: transaction.meta.fee ?? 0,
+        };
+      }
+    }
+
+    return null;
+  }
+
   async verifyUsdcDepositSignature(input: {
     signature: string;
     destinationOwnerAddress: string;
@@ -553,7 +669,7 @@ export class SolanaService {
 
     if (delta <= 0n) {
       throw new BadRequestException(
-        'That transaction did not increase this wallet’s devnet USDC balance.',
+        'That transaction did not increase this wallet’s USDC balance.',
       );
     }
 
@@ -578,7 +694,7 @@ export class SolanaService {
     amountInUsdcMinor: number;
   }): Promise<ChainTransfer> {
     const buyer = this.decryptCustodialKeypair(input.encryptedPrivateKey);
-    const treasury = this.getTreasuryKeypair();
+    const treasury = await this.getTreasuryKeypair();
     await this.assertSignerCanPayFees(treasury, 'Treasury');
     const source = await this.ensureTokenAccount(buyer.publicKey, treasury);
     const destination = await this.ensureTokenAccount(
@@ -593,7 +709,7 @@ export class SolanaService {
 
     if (sourceAccount.amount < BigInt(input.amountInUsdcMinor)) {
       throw new BadRequestException(
-        'Insufficient devnet USDC balance in the Lesenpad custodial wallet.',
+        'Insufficient USDC balance in the Lesenpad custodial wallet.',
       );
     }
 
@@ -645,7 +761,7 @@ export class SolanaService {
     destinationWalletAddress: string;
     amountInUsdcMinor: number;
   }): Promise<ChainTransfer> {
-    const treasury = this.getTreasuryKeypair();
+    const treasury = await this.getTreasuryKeypair();
     await this.assertSignerCanPayFees(treasury, 'Treasury');
     const destinationOwner = new PublicKey(input.destinationWalletAddress);
     const source = await this.ensureTokenAccount(treasury.publicKey, treasury);
@@ -661,7 +777,7 @@ export class SolanaService {
 
     if (sourceAccount.amount < BigInt(input.amountInUsdcMinor)) {
       throw new BadRequestException(
-        'Lesenpad treasury does not have enough devnet USDC for this withdrawal.',
+        'Lesenpad treasury does not have enough USDC for this withdrawal.',
       );
     }
 
@@ -717,7 +833,7 @@ export class SolanaService {
     const identity = input.authorityEncryptedPrivateKey
       ? this.decryptCustodialKeypair(input.authorityEncryptedPrivateKey)
       : undefined;
-    const { treasury, umi } = this.createUmiWithTreasuryPayer(identity);
+    const { treasury, umi } = await this.createUmiWithTreasuryPayer(identity);
     await this.assertSignerCanPayFees(treasury, 'Treasury');
     const masterMint = generateSigner(umi);
     const metadata = findMetadataPda(umi, {
@@ -813,7 +929,7 @@ export class SolanaService {
     const identity = input.authorityEncryptedPrivateKey
       ? this.decryptCustodialKeypair(input.authorityEncryptedPrivateKey)
       : undefined;
-    const { treasury, umi } = this.createUmiWithTreasuryPayer(identity);
+    const { treasury, umi } = await this.createUmiWithTreasuryPayer(identity);
     await this.assertSignerCanPayFees(treasury, 'Treasury');
     const collectionMint = generateSigner(umi);
     const metadata = findMetadataPda(umi, {
@@ -874,7 +990,7 @@ export class SolanaService {
     const identity = input.authorityEncryptedPrivateKey
       ? this.decryptCustodialKeypair(input.authorityEncryptedPrivateKey)
       : undefined;
-    const { treasury, umi } = this.createUmiWithTreasuryPayer(identity);
+    const { treasury, umi } = await this.createUmiWithTreasuryPayer(identity);
     await this.assertSignerCanPayFees(treasury, 'Treasury');
     const collection = this.getCollectionAccounts(
       umi,
@@ -947,7 +1063,7 @@ export class SolanaService {
           input.masterTokenAccountOwnerEncryptedPrivateKey,
         )
       : undefined;
-    const { treasury, umi } = this.createUmiWithTreasuryPayer(identity);
+    const { treasury, umi } = await this.createUmiWithTreasuryPayer(identity);
     await this.assertSignerCanPayFees(treasury, 'Treasury');
     const editionMint = generateSigner(umi);
     const metadata = findMetadataPda(umi, {
@@ -956,7 +1072,7 @@ export class SolanaService {
     const edition = findMasterEditionPda(umi, {
       mint: editionMint.publicKey,
     });
-    let builder = printV1(umi, {
+    const builder = printV1(umi, {
       editionMint,
       editionTokenAccountOwner: publicKey(input.destinationWalletAddress),
       masterEditionMint: publicKey(input.masterMintAddress),

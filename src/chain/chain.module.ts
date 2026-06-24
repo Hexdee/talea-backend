@@ -7,6 +7,7 @@ import { PriceQuoteService } from './price-quote.service';
 import { SolanaService } from './solana.service';
 import { SolanaWalletProviderService } from './solana-wallet-provider.service';
 import { VaultService } from './vault.service';
+import { TreasurySecretService } from './treasury-secret.service';
 import { WALLET_PROVIDER } from './wallet-provider.token';
 
 @Global()
@@ -19,6 +20,7 @@ import { WALLET_PROVIDER } from './wallet-provider.token';
     MediaStorageService,
     SolanaWalletProviderService,
     CircleWalletProviderService,
+    TreasurySecretService,
     {
       provide: WALLET_PROVIDER,
       inject: [
@@ -42,6 +44,7 @@ import { WALLET_PROVIDER } from './wallet-provider.token';
     PriceQuoteService,
     IpfsService,
     MediaStorageService,
+    TreasurySecretService,
     WALLET_PROVIDER,
   ],
 })

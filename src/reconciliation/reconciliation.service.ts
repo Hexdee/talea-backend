@@ -129,4 +129,8 @@ export class ReconciliationService implements OnModuleInit, OnModuleDestroy {
       await this.releaseLock();
     }
   }
+
+  async recoverPayoutRequest(payoutRequestId: string) {
+    return this.walletService.recoverPayoutRequest(payoutRequestId);
+  }
 }

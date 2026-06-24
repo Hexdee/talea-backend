@@ -1,4 +1,5 @@
 import { Injectable } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import { Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { ReconciliationService } from '../reconciliation/reconciliation.service';
@@ -8,30 +9,87 @@ export class OpsService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly reconciliationService: ReconciliationService,
+    private readonly configService: ConfigService,
   ) {}
 
   async getDashboard() {
-    const [pendingPayouts, stuckChainTx, deadLetterPayouts] = await Promise.all(
-      [
-        this.prisma.payoutRequest.count({
-          where: {
-            status: {
-              in: ['REQUESTED', 'REVIEWING', 'APPROVED'],
+    const [
+      pendingPayouts,
+      stuckChainTx,
+      deadLetterPayouts,
+      recentPayoutRequests,
+      recentFailedOnchainTxs,
+    ] = await Promise.all([
+      this.prisma.payoutRequest.count({
+        where: {
+          status: {
+            in: ['REQUESTED', 'REVIEWING', 'APPROVED'],
+          },
+        },
+      }),
+      this.prisma.onchainTransaction.count({
+        where: {
+          status: 'FAILED',
+        },
+      }),
+      this.prisma.payoutRequest.count({
+        where: {
+          status: 'DEAD_LETTER',
+        },
+      }),
+      this.prisma.payoutRequest.findMany({
+        where: {
+          status: {
+            in: ['REQUESTED', 'REVIEWING', 'APPROVED', 'DEAD_LETTER'],
+          },
+        },
+        orderBy: {
+          requestedAt: 'desc',
+        },
+        take: 10,
+        include: {
+          user: {
+            select: {
+              displayName: true,
+              email: true,
             },
           },
-        }),
-        this.prisma.onchainTransaction.count({
-          where: {
-            status: 'FAILED',
+          payoutAccount: {
+            select: {
+              label: true,
+              destinationType: true,
+              walletAddress: true,
+              bankName: true,
+            },
           },
-        }),
-        this.prisma.payoutRequest.count({
-          where: {
-            status: 'DEAD_LETTER',
+        },
+      }),
+      this.prisma.onchainTransaction.findMany({
+        where: {
+          status: 'FAILED',
+        },
+        orderBy: {
+          createdAt: 'desc',
+        },
+        take: 10,
+        include: {
+          user: {
+            select: {
+              displayName: true,
+              email: true,
+            },
           },
-        }),
-      ],
-    );
+          payoutRequest: {
+            select: {
+              id: true,
+              status: true,
+              requestedAt: true,
+              amountInUsdcMinor: true,
+            },
+          },
+        },
+      }),
+    ]);
 
     const ledgerMismatches = await this.prisma.$queryRaw<
       Array<{ mismatch_count: bigint }>
@@ -55,6 +113,17 @@ export class OpsService {
       failedWebhookCount: 0,
       failedOnchainTxCount: stuckChainTx,
       deadLetterPayoutCount: deadLetterPayouts,
+      treasurySecretSource: this.configService.get<string>(
+        'SOLANA_TREASURY_SECRET_SOURCE',
+        'file',
+      ),
+      hashicorpVaultConfigured:
+        Boolean(this.configService.get<string>('HASHICORP_VAULT_ADDR')?.trim()) &&
+        Boolean(
+          this.configService.get<string>('HASHICORP_VAULT_SECRET_PATH')?.trim(),
+        ),
+      recentPayoutRequests,
+      recentFailedOnchainTxs,
     };
   }
 
@@ -108,27 +177,7 @@ export class OpsService {
   }
 
   async retryPayout(payoutRequestId: string) {
-    const payout = await this.prisma.payoutRequest.findUnique({
-      where: { id: payoutRequestId },
-    });
-
-    if (!payout) {
-      return { success: false, message: 'Payout request not found.' };
-    }
-
-    await this.prisma.payoutRequest.update({
-      where: { id: payoutRequestId },
-      data: {
-        status: 'REVIEWING',
-        retryCount: {
-          increment: 1,
-        },
-        lastRetryAt: new Date(),
-        deadLetterReason: null,
-      },
-    });
-
-    return { success: true };
+    return this.reconciliationService.recoverPayoutRequest(payoutRequestId);
   }
 
   async repairFailedOnchainTx(signature: string) {

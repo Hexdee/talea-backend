@@ -451,6 +451,34 @@ model PayoutAccount {
   updatedAt           DateTime                  @updatedAt
 }
 
+model WithdrawalPolicy {
+  id                                 String   @id @default(cuid())
+  isEnabled                          Boolean  @default(true)
+  requireAllowlistedWallets          Boolean  @default(false)
+  manualApprovalThresholdInUsdcMinor Int      @default(100000000)
+  maxSingleWithdrawalInUsdcMinor     Int      @default(100000000)
+  maxRequestsPerDayPerWallet         Int      @default(5)
+  maxAmountPerDayPerWalletInUsdcMinor Int     @default(500000000)
+  maxRequestsPerDayGlobal            Int      @default(50)
+  maxAmountPerDayGlobalInUsdcMinor   Int      @default(2000000000)
+  createdAt                          DateTime @default(now())
+  updatedAt                          DateTime @updatedAt
+
+  @@index([isEnabled])
+}
+
+model WithdrawalAllowlistEntry {
+  id            String   @id @default(cuid())
+  walletAddress String   @unique
+  label         String
+  notes         String?
+  isActive      Boolean  @default(true)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@index([isActive])
+}
+
 model PayoutRequest {
   id                  String               @id @default(cuid())
   userId              String

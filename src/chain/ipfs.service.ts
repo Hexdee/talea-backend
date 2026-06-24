@@ -40,17 +40,18 @@ export class IpfsService {
 
   private getReadGatewayBases() {
     const raw = this.configService.get<string>('IPFS_READ_GATEWAY_BASES');
-    const bases = (raw
-      ? raw.split(',').map((value) => value.trim())
-      : [
-          // Prefer the configured gateway first for performance.
-          this.getGatewayBase(),
-          // Fallback public-good gateways (operated by IPFS Foundation/IPShipyard).
-          // Ref: https://ipfs.github.io/public-gateway-checker/
-          'https://ipfs.io',
-          'https://dweb.link',
-          'https://trustless-gateway.link',
-        ]
+    const bases = (
+      raw
+        ? raw.split(',').map((value) => value.trim())
+        : [
+            // Prefer the configured gateway first for performance.
+            this.getGatewayBase(),
+            // Fallback public-good gateways (operated by IPFS Foundation/IPShipyard).
+            // Ref: https://ipfs.github.io/public-gateway-checker/
+            'https://ipfs.io',
+            'https://dweb.link',
+            'https://trustless-gateway.link',
+          ]
     ).filter(Boolean);
 
     // Normalize and de-duplicate.
@@ -146,9 +147,7 @@ export class IpfsService {
 
       if (!response.ok) {
         const body = await response.text();
-        errors.push(
-          `${gatewayBase}: ${response.status} ${body.slice(0, 120)}`,
-        );
+        errors.push(`${gatewayBase}: ${response.status} ${body.slice(0, 120)}`);
         continue;
       }
 

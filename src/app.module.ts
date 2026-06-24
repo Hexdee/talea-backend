@@ -16,7 +16,6 @@ import { LibraryModule } from './library/library.module';
 import { OpsModule } from './ops/ops.module';
 import { PaymentsModule } from './payments/payments.module';
 import { PrismaModule } from './prisma/prisma.module';
-import { ReconciliationModule } from './reconciliation/reconciliation.module';
 import { WalletModule } from './wallet/wallet.module';
 
 @Module({
@@ -47,7 +46,6 @@ import { WalletModule } from './wallet/wallet.module';
     PaymentsModule,
     AnalyticsModule,
     WalletModule,
-    ReconciliationModule,
   ],
   providers: [
     {
