@@ -1,4 +1,8 @@
-import { BadRequestException, Injectable, ForbiddenException } from '@nestjs/common';
+import {
+  BadRequestException,
+  Injectable,
+  ForbiddenException,
+} from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { PayoutRequestStatus, WithdrawalAllowlistEntry } from '@prisma/client';
 import { PublicKey } from '@solana/web3.js';
@@ -14,6 +18,7 @@ export type WithdrawalPolicySnapshot = {
   maxAmountPerDayPerWalletInUsdcMinor: number;
   maxRequestsPerDayGlobal: number;
   maxAmountPerDayGlobalInUsdcMinor: number;
+  platformFeeBps: number;
   allowlist: WithdrawalAllowlistEntry[];
 };
 
@@ -26,6 +31,7 @@ type UpdateWithdrawalPolicyInput = {
   maxAmountPerDayPerWalletInUsdcMinor?: number;
   maxRequestsPerDayGlobal?: number;
   maxAmountPerDayGlobalInUsdcMinor?: number;
+  platformFeeBps?: number;
 };
 
 type AddAllowlistInput = {
@@ -86,6 +92,9 @@ export class WithdrawalPolicyService {
           'RISK_MAX_AMOUNT_PER_DAY_GLOBAL_USDC_MINOR',
           '2000000000',
         ),
+      ),
+      platformFeeBps: Number(
+        this.configService.get<string>('PLATFORM_FEE_BPS', '1000'),
       ),
     };
   }
@@ -153,8 +162,14 @@ export class WithdrawalPolicyService {
         maxAmountPerDayGlobalInUsdcMinor:
           input.maxAmountPerDayGlobalInUsdcMinor ??
           policy.maxAmountPerDayGlobalInUsdcMinor,
+        platformFeeBps: input.platformFeeBps ?? policy.platformFeeBps,
       },
     });
+  }
+
+  async getPlatformFeeBps() {
+    const policy = await this.ensurePolicyRow();
+    return policy.platformFeeBps;
   }
 
   async upsertAllowlistEntry(input: AddAllowlistInput) {
@@ -296,16 +311,13 @@ export class WithdrawalPolicyService {
       usage.globalAmountInUsdcMinor + input.amountInUsdcMinor >
       policy.maxAmountPerDayGlobalInUsdcMinor
     ) {
-      throw new BadRequestException(
-        'Daily withdrawal amount limit reached.',
-      );
+      throw new BadRequestException('Daily withdrawal amount limit reached.');
     }
 
     return {
       policy,
       requiresManualReview:
-        input.amountInUsdcMinor >=
-        policy.manualApprovalThresholdInUsdcMinor,
+        input.amountInUsdcMinor >= policy.manualApprovalThresholdInUsdcMinor,
       allowlisted: input.destinationWalletAddress
         ? await this.isWalletAllowlisted(input.destinationWalletAddress)
         : false,

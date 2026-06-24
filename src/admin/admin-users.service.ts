@@ -1,4 +1,8 @@
-import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
+import {
+  BadRequestException,
+  Injectable,
+  NotFoundException,
+} from '@nestjs/common';
 import { AuthAccountProvider, Prisma, Role } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 
@@ -19,7 +23,12 @@ export class AdminUsersService {
       where: trimmed
         ? {
             OR: [
-              { email: { contains: trimmed, mode: Prisma.QueryMode.insensitive } },
+              {
+                email: {
+                  contains: trimmed,
+                  mode: Prisma.QueryMode.insensitive,
+                },
+              },
               {
                 displayName: {
                   contains: trimmed,
@@ -79,10 +88,10 @@ export class AdminUsersService {
       throw new NotFoundException('User not found.');
     }
 
-    const nextRoles = Array.from(
-      new Set([Role.USER, ...(input.roles ?? [])]),
-    );
-    const removingSuperadmin = user.roles.includes(Role.SUPERADMIN) && !nextRoles.includes(Role.SUPERADMIN);
+    const nextRoles = Array.from(new Set([Role.USER, ...(input.roles ?? [])]));
+    const removingSuperadmin =
+      user.roles.includes(Role.SUPERADMIN) &&
+      !nextRoles.includes(Role.SUPERADMIN);
 
     if (removingSuperadmin) {
       const superadminCount = await this.prisma.user.count({

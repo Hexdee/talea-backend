@@ -1,6 +1,5 @@
 import {
   BadRequestException,
-  Inject,
   Injectable,
   UnauthorizedException,
 } from '@nestjs/common';
@@ -9,12 +8,10 @@ import { AuthAccountProvider, Role } from '@prisma/client';
 import * as bcrypt from 'bcryptjs';
 import { createHash, randomBytes } from 'node:crypto';
 import type { Response } from 'express';
-import { WALLET_PROVIDER } from '../chain/wallet-provider.token';
 import type {
   AuthenticatedRequest,
   SessionUser,
 } from '../common/types/authenticated-request';
-import type { WalletProvider } from '../chain/wallet-provider.interface';
 import { EmailsService } from '../emails/emails.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { LoginDto } from './dto/login.dto';
@@ -37,8 +34,6 @@ export class AuthService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly configService: ConfigService,
-    @Inject(WALLET_PROVIDER)
-    private readonly walletProvider: WalletProvider,
     private readonly emailsService: EmailsService,
   ) {}
 
@@ -126,8 +121,6 @@ export class AuthService {
 
     const passwordHash = await bcrypt.hash(dto.password, 10);
 
-    const custodialWallet = this.walletProvider.createWallet();
-
     const user = await this.prisma.user.create({
       data: {
         email: dto.email,
@@ -142,16 +135,6 @@ export class AuthService {
         },
         wallet: {
           create: {},
-        },
-        chainWallets: {
-          create: {
-            address: custodialWallet.address,
-            label: 'Lesenpad custodial wallet',
-            custodyType: 'CUSTODIAL',
-            encryptedPrivateKey: custodialWallet.encryptedPrivateKey,
-            isDefault: true,
-            isCreatorPayoutWallet: true,
-          },
         },
       },
     });
@@ -222,8 +205,6 @@ export class AuthService {
         id: true,
       },
     });
-    const custodialWallet = this.walletProvider.createWallet();
-
     const user = await this.prisma.user.upsert({
       where: {
         email: payload.email,
@@ -258,16 +239,6 @@ export class AuthService {
         },
         wallet: {
           create: {},
-        },
-        chainWallets: {
-          create: {
-            address: custodialWallet.address,
-            label: 'Lesenpad custodial wallet',
-            custodyType: 'CUSTODIAL',
-            encryptedPrivateKey: custodialWallet.encryptedPrivateKey,
-            isDefault: true,
-            isCreatorPayoutWallet: true,
-          },
         },
       },
     });

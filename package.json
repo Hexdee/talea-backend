@@ -7,7 +7,7 @@
   "packageManager": "pnpm@10.17.1",
   "license": "UNLICENSED",
   "scripts": {
-    "build": "nest build",
+    "build": "NODE_OPTIONS=--max-old-space-size=4096 nest build",
     "format": "prettier --write \"src/**/*.ts\" \"test/**/*.ts\" \"prisma/**/*.ts\"",
     "start": "nest start",
     "start:dev": "nest start --watch",
@@ -15,7 +15,7 @@
     "start:worker:dev": "ts-node --project tsconfig.json src/worker.ts",
     "start:debug": "nest start --debug --watch",
     "start:prod": "node dist/main",
-    "lint": "eslint \"{src,test,prisma}/**/*.ts\"",
+    "lint": "NODE_OPTIONS=--max-old-space-size=4096 eslint \"{src,test,prisma}/**/*.ts\"",
     "typecheck": "tsc --noEmit",
     "db:clear": "ts-node --project tsconfig.json scripts/clear-db.ts",
     "db:backup:drive": "ts-node --project tsconfig.json scripts/backup-db-to-drive.ts",

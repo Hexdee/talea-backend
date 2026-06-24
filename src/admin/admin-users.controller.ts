@@ -17,7 +17,10 @@ import { RolesGuard } from '../auth/guards/roles.guard';
 import { SessionAuthGuard } from '../auth/guards/session-auth.guard';
 import type { SessionUser } from '../common/types/authenticated-request';
 import { AdminUsersService } from './admin-users.service';
-import { ListAdminUsersQueryDto, UpdateUserRolesDto } from './dto/user-roles.dto';
+import {
+  ListAdminUsersQueryDto,
+  UpdateUserRolesDto,
+} from './dto/user-roles.dto';
 
 @ApiTags('admin')
 @Controller('admin/users')

@@ -1,7 +1,6 @@
 import { z } from 'zod';
 import {
-  DEFAULT_DEVNET_SOLANA_RPC_URL,
-  DEVNET_USDC_MINT_ADDRESS,
+  DEFAULT_MAINNET_SOLANA_RPC_URL,
   MAINNET_USDC_MINT_ADDRESS,
 } from './solana.constants';
 
@@ -45,9 +44,9 @@ export const envSchema = z
     SESSION_TTL_DAYS: integerString.default('14'),
     CHAIN_MASTER_KEY: requiredChainSecret('test-chain-master-key'),
     WALLET_PROVIDER: z.enum(['solana', 'circle']).default('solana'),
-    SOLANA_NETWORK: z.string().default('devnet'),
-    SOLANA_RPC_URL: z.string().default(DEFAULT_DEVNET_SOLANA_RPC_URL),
-    SOLANA_USDC_MINT_ADDRESS: requiredChainSecret(DEVNET_USDC_MINT_ADDRESS),
+    SOLANA_NETWORK: z.string().default('mainnet-beta'),
+    SOLANA_RPC_URL: z.string().default(DEFAULT_MAINNET_SOLANA_RPC_URL),
+    SOLANA_USDC_MINT_ADDRESS: requiredChainSecret(MAINNET_USDC_MINT_ADDRESS),
     SOLANA_TREASURY_SECRET_SOURCE: z
       .enum(['env', 'file', 'vault'])
       .default('file'),
@@ -70,12 +69,15 @@ export const envSchema = z
     RISK_DAILY_WITHDRAWAL_LIMIT_USDC_MINOR: integerString.default('500000000'),
     RISK_PER_MINUTE_REQUEST_LIMIT: integerString.default('20'),
     RISK_BLOCKED_WALLET_ADDRESSES: z.string().default(''),
-    RISK_MANUAL_APPROVAL_THRESHOLD_USDC_MINOR: integerString.default('100000000'),
+    RISK_MANUAL_APPROVAL_THRESHOLD_USDC_MINOR:
+      integerString.default('100000000'),
     RISK_MAX_SINGLE_WITHDRAWAL_USDC_MINOR: integerString.default('100000000'),
     RISK_MAX_REQUESTS_PER_DAY_PER_WALLET: integerString.default('5'),
-    RISK_MAX_AMOUNT_PER_DAY_PER_WALLET_USDC_MINOR: integerString.default('500000000'),
+    RISK_MAX_AMOUNT_PER_DAY_PER_WALLET_USDC_MINOR:
+      integerString.default('500000000'),
     RISK_MAX_REQUESTS_PER_DAY_GLOBAL: integerString.default('50'),
-    RISK_MAX_AMOUNT_PER_DAY_GLOBAL_USDC_MINOR: integerString.default('2000000000'),
+    RISK_MAX_AMOUNT_PER_DAY_GLOBAL_USDC_MINOR:
+      integerString.default('2000000000'),
     EMAILS_ENABLED: z.enum(['true', 'false']).default('false'),
     RESEND_API_KEY: z.string().optional(),
     RESEND_FROM_EMAIL: z.string().default('Lesenpad <onboarding@resend.dev>'),

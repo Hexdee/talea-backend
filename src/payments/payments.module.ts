@@ -2,13 +2,15 @@ import { Module } from '@nestjs/common';
 import { AuthModule } from '../auth/auth.module';
 import { BooksModule } from '../books/books.module';
 import { EmailsModule } from '../emails/emails.module';
+import { WithdrawalPolicyModule } from '../withdrawal-policy/withdrawal-policy.module';
 import { PaymentsController } from './payments.controller';
+import { DirectPaymentService } from './direct-payment.service';
 import { PaymentsService } from './payments.service';
 
 @Module({
-  imports: [AuthModule, BooksModule, EmailsModule],
+  imports: [AuthModule, BooksModule, EmailsModule, WithdrawalPolicyModule],
   controllers: [PaymentsController],
-  providers: [PaymentsService],
+  providers: [PaymentsService, DirectPaymentService],
   exports: [PaymentsService],
 })
 export class PaymentsModule {}

@@ -118,7 +118,9 @@ export class OpsService {
         'file',
       ),
       hashicorpVaultConfigured:
-        Boolean(this.configService.get<string>('HASHICORP_VAULT_ADDR')?.trim()) &&
+        Boolean(
+          this.configService.get<string>('HASHICORP_VAULT_ADDR')?.trim(),
+        ) &&
         Boolean(
           this.configService.get<string>('HASHICORP_VAULT_SECRET_PATH')?.trim(),
         ),

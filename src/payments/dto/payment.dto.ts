@@ -2,7 +2,6 @@ import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import {
   ArrayNotEmpty,
   IsArray,
-  IsEnum,
   IsOptional,
   IsString,
   ValidateIf,
@@ -30,6 +29,11 @@ export class CreateSolanaPaymentDto extends QuotePurchaseDto {
   @IsOptional()
   @IsString()
   ownershipWalletId?: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  ownershipWalletAddress?: string;
 }
 
 export class CompleteSolanaPaymentDto {
@@ -40,6 +44,11 @@ export class CompleteSolanaPaymentDto {
 
   @ApiPropertyOptional()
   @IsOptional()
-  @IsEnum(['CUSTODIAL', 'EXTERNAL'] as const)
-  payerMode?: 'CUSTODIAL' | 'EXTERNAL';
+  @IsString()
+  ownershipWalletAddress?: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  chainTxSignature?: string;
 }

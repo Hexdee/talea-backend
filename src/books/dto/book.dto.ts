@@ -108,7 +108,7 @@ export class PublishChapterDto {
   @ApiPropertyOptional()
   @IsOptional()
   @IsString()
-  sellerWalletId?: string;
+  sellerWalletAddress?: string;
 }
 
 export class ChapterChecklistItemDto {

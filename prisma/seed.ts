@@ -87,14 +87,11 @@ function encryptPayload(payload: string) {
   };
 }
 
-function createCustodialWallet() {
+function createExternalWallet() {
   const keypair = Keypair.generate();
 
   return {
     address: keypair.publicKey.toBase58(),
-    encryptedPrivateKey: encryptString(
-      Buffer.from(keypair.secretKey).toString('base64'),
-    ),
   };
 }
 
@@ -664,7 +661,7 @@ async function createUser(params: {
   password: string;
 }) {
   const passwordHash = await bcrypt.hash(params.password, 10);
-  const custodialWallet = createCustodialWallet();
+  const externalWallet = createExternalWallet();
 
   return prisma.user.create({
     data: {
@@ -683,12 +680,10 @@ async function createUser(params: {
       },
       chainWallets: {
         create: {
-          address: custodialWallet.address,
-          label: 'Lesenpad custodial wallet',
-          custodyType: 'CUSTODIAL',
-          encryptedPrivateKey: custodialWallet.encryptedPrivateKey,
+          address: externalWallet.address,
+          label: 'Lesenpad external wallet',
+          custodyType: 'EXTERNAL',
           isDefault: true,
-          isCreatorPayoutWallet: true,
         },
       },
     },

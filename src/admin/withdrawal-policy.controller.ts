@@ -25,7 +25,7 @@ import { WithdrawalPolicyService } from '../withdrawal-policy/withdrawal-policy.
 @ApiTags('admin')
 @Controller('admin/withdrawal-policy')
 @UseGuards(SessionAuthGuard, RolesGuard)
-@Roles(Role.ADMIN, Role.SUPERADMIN)
+@Roles(Role.SUPERADMIN)
 export class WithdrawalPolicyController {
   constructor(
     private readonly withdrawalPolicyService: WithdrawalPolicyService,

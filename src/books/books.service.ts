@@ -6,7 +6,6 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { BookStatus, OfferType, SourceFormat } from '@prisma/client';
-import type { UserChainWallet } from '@prisma/client';
 import type { SessionUser } from '../common/types/authenticated-request';
 import { renderPublishedHtml } from '../common/utils/content';
 import { formatCurrency } from '../common/utils/currency';
@@ -212,10 +211,7 @@ export class BooksService {
     return fallback;
   }
 
-  private async ensureBookCollection(
-    bookId: string,
-    authorityWallet: UserChainWallet,
-  ) {
+  private async ensureBookCollection(bookId: string) {
     const book = await this.prisma.book.findUnique({
       where: { id: bookId },
       include: {
@@ -265,12 +261,6 @@ export class BooksService {
       );
     }
 
-    if (!authorityWallet.encryptedPrivateKey) {
-      throw new BadRequestException(
-        'A custodial wallet is required to create an onchain collection for paid chapters.',
-      );
-    }
-
     const collectionMetadata = await this.ipfsService.uploadJson(
       `${book.slug}-collection-metadata`,
       {
@@ -293,7 +283,6 @@ export class BooksService {
     const collectionAsset = await this.solanaService.createBookCollectionAsset({
       name: `${book.title} Collection`,
       uri: collectionMetadata.uri,
-      authorityEncryptedPrivateKey: authorityWallet.encryptedPrivateKey,
     });
 
     const updated = await this.prisma.book.update({
@@ -1225,12 +1214,21 @@ export class BooksService {
       );
     }
 
-    const sellerWallet = await this.getDefaultWallet(
-      userId,
-      dto.sellerWalletId,
-    );
+    const sellerWalletAddress = dto.sellerWalletAddress?.trim();
+    if (!sellerWalletAddress) {
+      throw new BadRequestException(
+        'A settlement wallet address is required to publish paid chapters.',
+      );
+    }
+
+    if (!this.solanaService.isValidAddress(sellerWalletAddress)) {
+      throw new BadRequestException(
+        'A valid Solana wallet address is required to publish paid chapters.',
+      );
+    }
+
     const bookCollection = !dto.isFree
-      ? await this.ensureBookCollection(chapter.bookId, sellerWallet)
+      ? await this.ensureBookCollection(chapter.bookId)
       : null;
     const encrypted = await this.buildEncryptedChapterPackage(chapter);
     const nextRevision = chapter.publishedRevision + 1;
@@ -1282,7 +1280,6 @@ export class BooksService {
           await this.solanaService.attachNftToCollection({
             nftMetadataAddress: chapter.edition.metadataAddress,
             collectionMintAddress: bookCollection.collectionMintAddress,
-            authorityEncryptedPrivateKey: sellerWallet.encryptedPrivateKey,
           });
 
         editionAsset = {
@@ -1315,7 +1312,6 @@ export class BooksService {
         uri: metadataUpload.uri,
         maxCopies: dto.maxCopies!,
         collectionMintAddress: bookCollection?.collectionMintAddress,
-        authorityEncryptedPrivateKey: sellerWallet.encryptedPrivateKey,
       });
     }
 
@@ -1354,7 +1350,7 @@ export class BooksService {
           cipherSpec: encrypted.cipherSpec,
           plaintextHash: encrypted.plaintextHash,
           metadataJson: {
-            sellerWalletAddress: sellerWallet.address,
+            sellerWalletAddress,
             network: this.solanaService.getNetwork(),
             ipfsUri: encrypted.ipfsUri,
             storageProvider: 'IPFS',
@@ -1396,7 +1392,7 @@ export class BooksService {
             metadataUri: editionAsset.metadataUri ?? metadataUpload.uri,
             collectionMintAddress: editionAsset.collectionMintAddress,
             priceInUsdcMinor: dto.priceInUsdcMinor!,
-            sellerWalletAddress: sellerWallet.address,
+            sellerWalletAddress,
             maxCopies: chapter.edition?.maxCopies ?? dto.maxCopies!,
             ipfsCid: encrypted.ipfsCid,
             publishedRevisionHash,
@@ -1413,7 +1409,7 @@ export class BooksService {
             collectionMintAddress: editionAsset.collectionMintAddress,
             maxCopies: dto.maxCopies!,
             priceInUsdcMinor: dto.priceInUsdcMinor!,
-            sellerWalletAddress: sellerWallet.address,
+            sellerWalletAddress,
             ipfsCid: encrypted.ipfsCid,
             publishedRevisionHash,
           },

@@ -4,4 +4,5 @@ export const DEVNET_USDC_MINT_ADDRESS =
 export const MAINNET_USDC_MINT_ADDRESS =
   'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
 
-export const DEFAULT_DEVNET_SOLANA_RPC_URL = 'https://api.devnet.solana.com';
+export const DEFAULT_MAINNET_SOLANA_RPC_URL =
+  'https://api.mainnet-beta.solana.com';

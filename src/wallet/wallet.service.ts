@@ -129,14 +129,14 @@ export class WalletService {
     const wallet = await this.prisma.userChainWallet.findFirst({
       where: {
         userId,
-        custodyType: 'CUSTODIAL',
+        custodyType: 'EXTERNAL',
         isActive: true,
       },
       orderBy: [{ isDefault: 'desc' }, { createdAt: 'asc' }],
     });
 
     if (!wallet) {
-      throw new NotFoundException('Custodial Lesenpad wallet not found.');
+      throw new NotFoundException('Linked Lesenpad wallet not found.');
     }
 
     return wallet;
@@ -244,7 +244,10 @@ export class WalletService {
           },
           create: {
             signature,
-            network: this.configService.get<string>('SOLANA_NETWORK', 'devnet'),
+            network: this.configService.get<string>(
+              'SOLANA_NETWORK',
+              'mainnet-beta',
+            ),
             txType: OnchainTransactionType.DEPOSIT,
             status: OnchainTransactionStatus.CONFIRMED,
             slot: verification.confirmationSlot ?? undefined,
@@ -346,7 +349,7 @@ export class WalletService {
 
     const defaultCustodialWallet = chainWallets.find(
       (item) =>
-        item.custodyType === 'CUSTODIAL' && item.isActive && item.isDefault,
+        item.custodyType === 'EXTERNAL' && item.isActive && item.isDefault,
     );
     if (defaultCustodialWallet) {
       try {
@@ -388,7 +391,10 @@ export class WalletService {
       payoutAccounts,
       payoutRequests,
       treasurySettlement: {
-        network: this.configService.get<string>('SOLANA_NETWORK', 'devnet'),
+        network: this.configService.get<string>(
+          'SOLANA_NETWORK',
+          'mainnet-beta',
+        ),
         usdcMintAddress: this.configService.get<string>(
           'SOLANA_USDC_MINT_ADDRESS',
           '',
@@ -406,7 +412,6 @@ export class WalletService {
             : item.lastObservedUsdcBalanceMinor,
         isDefault: item.isDefault,
         isActive: item.isActive,
-        isCreatorPayoutWallet: item.isCreatorPayoutWallet,
         createdAt: item.createdAt,
       })),
     };
@@ -579,7 +584,10 @@ export class WalletService {
         },
         create: {
           signature: input.signature,
-          network: this.configService.get<string>('SOLANA_NETWORK', 'devnet'),
+          network: this.configService.get<string>(
+            'SOLANA_NETWORK',
+            'mainnet-beta',
+          ),
           txType: OnchainTransactionType.USDC_TRANSFER,
           status: OnchainTransactionStatus.CONFIRMED,
           slot: input.slot ?? undefined,
@@ -632,7 +640,7 @@ export class WalletService {
       };
     }
 
-    const payoutAccount = payout.payoutAccount!;
+    const payoutAccount = payout.payoutAccount;
     const walletAddress = payoutAccount.walletAddress;
     if (!walletAddress) {
       return {
@@ -772,9 +780,8 @@ export class WalletService {
     const user = payout.user;
     let transfer: Awaited<ReturnType<WalletProvider['signTransfer']>> | null =
       null;
-    let sponsoredGas: Awaited<
-      ReturnType<WalletProvider['sponsorGas']>
-    > | null = null;
+    let sponsoredGas: Awaited<ReturnType<WalletProvider['sponsorGas']>> | null =
+      null;
 
     try {
       transfer = await this.walletProvider.signTransfer({
@@ -835,8 +842,7 @@ export class WalletService {
             pendingDeltaInUsdcMinor: -payout.amountInUsdcMinor,
             description: 'External Solana withdrawal debited',
             reference: transferSignature,
-            mirrorWalletTransactionType:
-              WalletTransactionType.PAYOUT_COMPLETED,
+            mirrorWalletTransactionType: WalletTransactionType.PAYOUT_COMPLETED,
           },
           tx,
         );
@@ -881,7 +887,10 @@ export class WalletService {
           },
           create: {
             signature: transferSignature,
-            network: this.configService.get<string>('SOLANA_NETWORK', 'devnet'),
+            network: this.configService.get<string>(
+              'SOLANA_NETWORK',
+              'mainnet-beta',
+            ),
             txType: OnchainTransactionType.USDC_TRANSFER,
             status: OnchainTransactionStatus.CONFIRMED,
             slot: transfer.confirmationSlot ?? undefined,
@@ -1092,7 +1101,10 @@ export class WalletService {
     }
 
     if (payout.status === PayoutRequestStatus.PAID) {
-      return { success: false, message: 'Completed payouts cannot be rejected.' };
+      return {
+        success: false,
+        message: 'Completed payouts cannot be rejected.',
+      };
     }
 
     if (
@@ -1149,7 +1161,7 @@ export class WalletService {
   async refreshDepositsForAllUsers(limit = 250) {
     const wallets = await this.prisma.userChainWallet.findMany({
       where: {
-        custodyType: 'CUSTODIAL',
+        custodyType: 'EXTERNAL',
         isActive: true,
       },
       orderBy: { updatedAt: 'asc' },
@@ -1212,7 +1224,10 @@ export class WalletService {
         },
         create: {
           signature: dto.signature,
-          network: this.configService.get<string>('SOLANA_NETWORK', 'devnet'),
+          network: this.configService.get<string>(
+            'SOLANA_NETWORK',
+            'mainnet-beta',
+          ),
           txType: OnchainTransactionType.DEPOSIT,
           status: OnchainTransactionStatus.CONFIRMED,
           slot: verification.confirmationSlot ?? undefined,

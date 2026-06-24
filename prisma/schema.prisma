@@ -75,8 +75,8 @@ enum PayoutRequestStatus {
 }
 
 enum ChainWalletCustodyType {
-  CUSTODIAL
   EXTERNAL
+  EMBEDDED
 }
 
 enum WithdrawalDestinationType {
@@ -461,6 +461,7 @@ model WithdrawalPolicy {
   maxAmountPerDayPerWalletInUsdcMinor Int     @default(500000000)
   maxRequestsPerDayGlobal            Int      @default(50)
   maxAmountPerDayGlobalInUsdcMinor   Int      @default(2000000000)
+  platformFeeBps                     Int      @default(1000)
   createdAt                          DateTime @default(now())
   updatedAt                          DateTime @updatedAt
 
@@ -518,14 +519,12 @@ model UserChainWallet {
   address                      String                 @unique
   label                        String
   custodyType                  ChainWalletCustodyType
-  encryptedPrivateKey          String?
-  encryptionKeyVersion         Int                    @default(1)
+  providerWalletId             String?                @unique
   usdcTokenAccountAddress      String?
   lastObservedUsdcBalanceMinor Int                    @default(0)
   lastDepositSignature         String?
   isDefault                    Boolean                @default(false)
   isActive                     Boolean                @default(true)
-  isCreatorPayoutWallet        Boolean                @default(false)
   createdAt                    DateTime               @default(now())
   updatedAt                    DateTime               @updatedAt
   ownedTokens                  ChapterToken[]

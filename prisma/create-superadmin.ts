@@ -69,7 +69,9 @@ function deriveDisplayName(email: string) {
 }
 
 function mergeRoles(existingRoles: Role[]) {
-  return Array.from(new Set([Role.USER, ...existingRoles, Role.ADMIN, Role.SUPERADMIN]));
+  return Array.from(
+    new Set([Role.USER, ...existingRoles, Role.ADMIN, Role.SUPERADMIN]),
+  );
 }
 
 async function main() {

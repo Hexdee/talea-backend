@@ -17,6 +17,7 @@ import {
 } from '@solana/web3.js';
 import {
   createAssociatedTokenAccountInstruction,
+  createTransferCheckedInstruction,
   createTransferInstruction,
   getAccount,
   getAssociatedTokenAddress,
@@ -153,7 +154,7 @@ export class SolanaService {
   }
 
   getNetwork() {
-    return this.configService.get<string>('SOLANA_NETWORK', 'devnet');
+    return this.configService.get<string>('SOLANA_NETWORK', 'mainnet-beta');
   }
 
   getConfirmationCommitment(): 'processed' | 'confirmed' | 'finalized' {
@@ -200,6 +201,119 @@ export class SolanaService {
 
   async getTreasuryAddress() {
     return (await this.getTreasuryKeypair()).publicKey.toBase58();
+  }
+
+  async buildSponsoredUsdcTransferTransaction(input: {
+    sourceOwnerAddress: string;
+    recipientTransfers: Array<{
+      destinationOwnerAddress: string;
+      amountInUsdcMinor: number;
+    }>;
+  }) {
+    const treasury = await this.getTreasuryKeypair();
+    await this.assertSignerCanPayFees(treasury, 'Treasury');
+
+    const sourceOwner = new PublicKey(input.sourceOwnerAddress);
+    const mint = this.getUsdcMint();
+    const sourceTokenAccount = await getAssociatedTokenAddress(
+      mint,
+      sourceOwner,
+    );
+    const sourceBalance = await this.getUsdcBalance(input.sourceOwnerAddress);
+
+    const transfers = input.recipientTransfers.filter(
+      (transfer) => transfer.amountInUsdcMinor > 0,
+    );
+
+    if (transfers.length === 0) {
+      throw new BadRequestException(
+        'At least one recipient transfer is required.',
+      );
+    }
+
+    const expectedSourceAmount = transfers.reduce(
+      (sum, transfer) => sum + transfer.amountInUsdcMinor,
+      0,
+    );
+
+    if (sourceBalance < expectedSourceAmount) {
+      throw new BadRequestException(
+        'The connected wallet does not have enough USDC for this purchase.',
+      );
+    }
+
+    const recipientAccounts = await Promise.all(
+      transfers.map(async (transfer) => {
+        const destinationOwner = new PublicKey(
+          transfer.destinationOwnerAddress,
+        );
+        const destinationTokenAccount = await getAssociatedTokenAddress(
+          mint,
+          destinationOwner,
+        );
+        const accountInfo = await this.connection.getAccountInfo(
+          destinationTokenAccount,
+          this.getFinalityCommitment(),
+        );
+
+        return {
+          destinationOwner,
+          destinationTokenAccount,
+          needsCreation: !accountInfo,
+          amountInUsdcMinor: transfer.amountInUsdcMinor,
+        };
+      }),
+    );
+
+    const { blockhash, lastValidBlockHeight } =
+      await this.connection.getLatestBlockhash(this.getFinalityCommitment());
+    const transaction = new Transaction();
+    transaction.feePayer = treasury.publicKey;
+    transaction.recentBlockhash = blockhash;
+
+    for (const recipient of recipientAccounts) {
+      if (recipient.needsCreation) {
+        transaction.add(
+          createAssociatedTokenAccountInstruction(
+            treasury.publicKey,
+            recipient.destinationTokenAccount,
+            recipient.destinationOwner,
+            mint,
+          ),
+        );
+      }
+    }
+
+    for (const recipient of recipientAccounts) {
+      transaction.add(
+        createTransferCheckedInstruction(
+          sourceTokenAccount,
+          mint,
+          recipient.destinationTokenAccount,
+          sourceOwner,
+          BigInt(recipient.amountInUsdcMinor),
+          6,
+        ),
+      );
+    }
+
+    transaction.partialSign(treasury);
+
+    return {
+      transactionBase64: transaction
+        .serialize({
+          requireAllSignatures: false,
+          verifySignatures: false,
+        })
+        .toString('base64'),
+      feePayerAddress: treasury.publicKey.toBase58(),
+      sourceTokenAccountAddress: sourceTokenAccount.toBase58(),
+      recipientTokenAccountAddresses: recipientAccounts.map((recipient) =>
+        recipient.destinationTokenAccount.toBase58(),
+      ),
+      recentBlockhash: blockhash,
+      lastValidBlockHeight,
+    };
   }
 
   private decryptCustodialKeypair(encryptedPrivateKey: string) {
@@ -686,6 +800,133 @@ export class SolanaService {
       blockTime: transaction.blockTime
         ? new Date(transaction.blockTime * 1000)
         : null,
+    };
+  }
+
+  async verifyUsdcTransferSignature(input: {
+    signature: string;
+    sourceOwnerAddress: string;
+    destinationOwnerAddress: string;
+    amountInUsdcMinor: number;
+  }) {
+    return this.verifyUsdcTransferSignatureWithRecipients({
+      signature: input.signature,
+      sourceOwnerAddress: input.sourceOwnerAddress,
+      recipientTransfers: [
+        {
+          destinationOwnerAddress: input.destinationOwnerAddress,
+          amountInUsdcMinor: input.amountInUsdcMinor,
+        },
+      ],
+    });
+  }
+
+  async verifyUsdcTransferSignatureWithRecipients(input: {
+    signature: string;
+    sourceOwnerAddress: string;
+    recipientTransfers: Array<{
+      destinationOwnerAddress: string;
+      amountInUsdcMinor: number;
+    }>;
+  }) {
+    let transaction: Awaited<
+      ReturnType<Connection['getParsedTransaction']>
+    > | null = null;
+    try {
+      transaction = await this.connection.getParsedTransaction(
+        input.signature,
+        {
+          commitment: this.getFinalityCommitment(),
+          maxSupportedTransactionVersion: 0,
+        },
+      );
+    } catch (error) {
+      throw new BadRequestException(
+        'Invalid transfer signature or unsupported transaction format.',
+        { cause: error },
+      );
+    }
+
+    if (!transaction?.meta) {
+      throw new BadRequestException('Transfer transaction was not found.');
+    }
+
+    const mint = this.getUsdcMintAddress();
+    const pre = transaction.meta.preTokenBalances ?? [];
+    const post = transaction.meta.postTokenBalances ?? [];
+    const sourceBefore = pre
+      .filter(
+        (balance) =>
+          balance.owner === input.sourceOwnerAddress && balance.mint === mint,
+      )
+      .reduce((sum, balance) => sum + BigInt(balance.uiTokenAmount.amount), 0n);
+    const sourceAfter = post
+      .filter(
+        (balance) =>
+          balance.owner === input.sourceOwnerAddress && balance.mint === mint,
+      )
+      .reduce((sum, balance) => sum + BigInt(balance.uiTokenAmount.amount), 0n);
+    const expectedSource = input.recipientTransfers.reduce(
+      (sum, item) => sum + BigInt(item.amountInUsdcMinor),
+      0n,
+    );
+
+    if (sourceBefore - sourceAfter !== expectedSource) {
+      throw new BadRequestException(
+        'That transaction did not debit the expected USDC amount from the payer wallet.',
+      );
+    }
+
+    for (const transfer of input.recipientTransfers) {
+      const destinationBefore = pre
+        .filter(
+          (balance) =>
+            balance.owner === transfer.destinationOwnerAddress &&
+            balance.mint === mint,
+        )
+        .reduce((sum, balance) => sum + BigInt(balance.uiTokenAmount.amount), 0n);
+      const destinationAfter = post
+        .filter(
+          (balance) =>
+            balance.owner === transfer.destinationOwnerAddress &&
+            balance.mint === mint,
+        )
+        .reduce((sum, balance) => sum + BigInt(balance.uiTokenAmount.amount), 0n);
+
+      const expected = BigInt(transfer.amountInUsdcMinor);
+      if (destinationAfter - destinationBefore !== expected) {
+        throw new BadRequestException(
+          'That transaction did not credit the expected USDC amount to a settlement wallet.',
+        );
+      }
+    }
+
+    return {
+      signature: input.signature,
+      amountInUsdcMinor: input.recipientTransfers.reduce(
+        (sum, item) => sum + item.amountInUsdcMinor,
+        0,
+      ),
+      sourceTokenAccountAddress: (
+        await getAssociatedTokenAddress(
+          this.getUsdcMint(),
+          new PublicKey(input.sourceOwnerAddress),
+        )
+      ).toBase58(),
+      destinationTokenAccountAddress: (
+        await getAssociatedTokenAddress(
+          this.getUsdcMint(),
+          new PublicKey(
+            input.recipientTransfers[0]?.destinationOwnerAddress ??
+              input.sourceOwnerAddress,
+          ),
+        )
+      ).toBase58(),
+      confirmationSlot: transaction.slot,
+      blockTime: transaction.blockTime
+        ? new Date(transaction.blockTime * 1000)
+        : null,
+      feeInLamports: transaction.meta.fee ?? 0,
     };
   }
 

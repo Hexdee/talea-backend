@@ -31,7 +31,9 @@ export class TreasurySecretService {
   }
 
   private getVaultToken() {
-    const token = this.configService.get<string>('HASHICORP_VAULT_TOKEN')?.trim();
+    const token = this.configService
+      .get<string>('HASHICORP_VAULT_TOKEN')
+      ?.trim();
     if (token) {
       return token;
     }
@@ -49,7 +51,9 @@ export class TreasurySecretService {
   }
 
   private async readFromVault() {
-    const baseUrl = this.configService.get<string>('HASHICORP_VAULT_ADDR')?.trim();
+    const baseUrl = this.configService
+      .get<string>('HASHICORP_VAULT_ADDR')
+      ?.trim();
     const secretPath = this.configService
       .get<string>('HASHICORP_VAULT_SECRET_PATH')
       ?.trim();
@@ -84,7 +88,8 @@ export class TreasurySecretService {
     }
 
     const payload = (await response.json()) as VaultSecretResponse;
-    const secret = payload.data?.data?.[secretField] ?? payload.data?.[secretField];
+    const secret =
+      payload.data?.data?.[secretField] ?? payload.data?.[secretField];
 
     if (typeof secret !== 'string' || !secret.trim()) {
       throw new ServiceUnavailableException(

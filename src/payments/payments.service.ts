@@ -1,19 +1,9 @@
 import {
   BadRequestException,
-  ForbiddenException,
-  InternalServerErrorException,
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
-import {
-  LedgerEntryType,
-  OnchainTransactionStatus,
-  OnchainTransactionType,
-  OrderStatus,
-  PaymentStatus,
-  Prisma,
-  WalletTransactionType,
-} from '@prisma/client';
+import { LedgerEntryType } from '@prisma/client';
 import { BooksService } from '../books/books.service';
 import { PriceQuoteService } from '../chain/price-quote.service';
 import { SolanaService } from '../chain/solana.service';
@@ -21,11 +11,13 @@ import { formatCurrency } from '../common/utils/currency';
 import { EmailsService } from '../emails/emails.service';
 import { LedgerService } from '../ledger/ledger.service';
 import { PrismaService } from '../prisma/prisma.service';
+import { WithdrawalPolicyService } from '../withdrawal-policy/withdrawal-policy.service';
 import {
   CompleteSolanaPaymentDto,
   CreateSolanaPaymentDto,
   QuotePurchaseDto,
 } from './dto/payment.dto';
+import { DirectPaymentService } from './direct-payment.service';
 
 function buildReference() {
   return `LSP-LEDGER-${Date.now()}-${Math.random().toString(36).slice(2, 8).toUpperCase()}`;
@@ -72,6 +64,8 @@ export class PaymentsService {
     private readonly priceQuoteService: PriceQuoteService,
     private readonly ledgerService: LedgerService,
     private readonly emailsService: EmailsService,
+    private readonly directPaymentService: DirectPaymentService,
+    private readonly withdrawalPolicyService: WithdrawalPolicyService,
   ) {}
 
   private getDailyPurchaseLimit() {
@@ -414,10 +408,19 @@ export class PaymentsService {
     const context = await this.buildPurchaseContext(userId, dto);
     const user = await this.prisma.user.findUnique({
       where: { id: userId },
+      select: { email: true },
     });
 
     if (!user) {
       throw new NotFoundException('User not found.');
+    }
+
+    const sourceOwnerAddress =
+      dto.ownershipWalletAddress?.trim() ?? dto.ownershipWalletId?.trim();
+    if (!sourceOwnerAddress) {
+      throw new BadRequestException(
+        'A connected wallet address is required to create this payment intent.',
+      );
     }
 
     const totalAmountInUsdcMinor = context.items.reduce(
@@ -429,6 +432,36 @@ export class PaymentsService {
     );
     const recipientWalletAddress =
       context.items[0]?.sellerWalletAddress ?? null;
+
+    if (!recipientWalletAddress) {
+      throw new BadRequestException(
+        'This purchase is missing a settlement wallet address.',
+      );
+    }
+
+    const platformFeeBps =
+      await this.withdrawalPolicyService.getPlatformFeeBps();
+    const platformFeeInUsdcMinor = Math.floor(
+      (totalAmountInUsdcMinor * platformFeeBps) / 10_000,
+    );
+    const sellerNetAmountInUsdcMinor =
+      totalAmountInUsdcMinor - platformFeeInUsdcMinor;
+    const platformTreasuryWalletAddress =
+      await this.solanaService.getTreasuryAddress();
+    const sponsoredTransfer =
+      await this.solanaService.buildSponsoredUsdcTransferTransaction({
+        sourceOwnerAddress,
+        recipientTransfers: [
+          {
+            destinationOwnerAddress: recipientWalletAddress,
+            amountInUsdcMinor: sellerNetAmountInUsdcMinor,
+          },
+          {
+            destinationOwnerAddress: platformTreasuryWalletAddress,
+            amountInUsdcMinor: platformFeeInUsdcMinor,
+          },
+        ],
+      });
 
     const order = await this.prisma.order.create({
       data: {
@@ -457,11 +490,16 @@ export class PaymentsService {
         orderId: order.id,
         amountInUsdcMinor: totalAmountInUsdcMinor,
         currency: 'USDC',
-        provider: 'LEDGER_USDC',
+        provider: 'DIRECT_USDC_TRANSFER',
         providerPayload: {
           stage: 'reserved',
-          mode: 'ledger-first',
+          mode: 'user-signed-sponsored-transfer',
           estimatedGasFeeInUsdcMinor,
+          recipientWalletAddress,
+          platformTreasuryWalletAddress,
+          platformFeeBps,
+          platformFeeInUsdcMinor,
+          sellerNetAmountInUsdcMinor,
         },
       },
     });
@@ -481,11 +519,23 @@ export class PaymentsService {
       network: this.solanaService.getNetwork(),
       totalAmountInUsdcMinor,
       estimatedGasFeeInUsdcMinor,
+      recipientWalletAddress,
+      platformTreasuryWalletAddress,
+      platformFeeBps,
+      platformFeeInUsdcMinor,
+      sellerNetAmountInUsdcMinor,
+      sponsoredTransferBase64: sponsoredTransfer.transactionBase64,
+      sponsoredTransferFeePayerAddress: sponsoredTransfer.feePayerAddress,
+      sponsoredTransferRecentBlockhash: sponsoredTransfer.recentBlockhash,
+      sponsoredTransferLastValidBlockHeight:
+        sponsoredTransfer.lastValidBlockHeight,
+      usdcMintAddress: this.solanaService.getUsdcMintAddress(),
       formattedAmount: formatCurrency(totalAmountInUsdcMinor, 'USDC'),
       formattedEstimatedGasFee: formatCurrency(
         estimatedGasFeeInUsdcMinor,
         'USDC',
       ),
+      formattedPlatformFee: formatCurrency(platformFeeInUsdcMinor, 'USDC'),
       itemCount: context.items.length,
     };
   }
@@ -495,773 +545,23 @@ export class PaymentsService {
     reference: string,
     dto: CompleteSolanaPaymentDto,
   ) {
-    const payment = await this.prisma.payment.findUnique({
-      where: { reference },
-      include: {
-        order: {
-          include: {
-            user: true,
-            items: {
-              include: {
-                offer: {
-                  include: {
-                    book: true,
-                  },
-                },
-                chapter: true,
-                chapterEdition: true,
-              },
-            },
-            reservations: true,
-          },
-        },
-      },
-    });
-
-    if (!payment) {
-      throw new NotFoundException('Payment not found.');
-    }
-
-    if (payment.order.userId !== userId) {
-      throw new ForbiddenException('You cannot complete this payment.');
-    }
-
-    const firstPurchasedChapterNumber =
-      payment.order.items
-        .map((item) => item.chapter?.chapterNumber ?? Number.MAX_SAFE_INTEGER)
-        .sort((left, right) => left - right)[0] ?? 1;
-
-    if (payment.status === PaymentStatus.SUCCEEDED) {
-      const payload =
-        payment.providerPayload &&
-        typeof payment.providerPayload === 'object' &&
-        !Array.isArray(payment.providerPayload)
-          ? (payment.providerPayload as Record<string, unknown>)
-          : {};
-      const gasFeeInUsdcMinor =
-        typeof payload.totalGasFeeInUsdcMinor === 'number'
-          ? payload.totalGasFeeInUsdcMinor
-          : undefined;
-
-      return {
-        reference,
-        status: 'SUCCEEDED',
-        network: this.solanaService.getNetwork(),
-        chainTxSignature: payment.chainTxSignature ?? 'N/A',
-        formattedAmount: formatCurrency(payment.amountInUsdcMinor, 'USDC'),
-        firstPurchasedChapterNumber,
-        gasFeeInUsdcMinor,
-        formattedGasFee:
-          typeof gasFeeInUsdcMinor === 'number'
-            ? formatCurrency(gasFeeInUsdcMinor, 'USDC')
-            : undefined,
-      };
-    }
-
-    if (payment.status !== PaymentStatus.PENDING) {
-      throw new BadRequestException('This payment is no longer pending.');
-    }
-
-    if (
-      payment.order.reservations.some(
-        (reservation) => reservation.expiresAt < new Date(),
-      )
-    ) {
-      throw new BadRequestException(
-        'This reservation expired. Create a new payment intent.',
-      );
-    }
-
-    const ownershipWallet = await this.booksService.getDefaultWallet(
+    const directResult = await this.directPaymentService.completeDirectTransfer(
       userId,
-      dto.ownershipWalletId,
-    );
-    if (this.blockedWalletSet().has(ownershipWallet.address)) {
-      throw new BadRequestException(
-        'Risk policy blocked this wallet from checkout. Contact support.',
-      );
-    }
-    await this.enforceVelocityAndCaps(userId, payment.amountInUsdcMinor);
-
-    const estimatedGasFeeInUsdcMinor = await this.estimateGasFeeInUsdcMinor(
-      payment.order.items.length,
+      reference,
+      dto,
     );
 
-    const mintedAssets: Array<{
-      itemId: string;
-      chapterEditionId: string;
-      chapterNumber: number;
-      mintAddress: string;
-      tokenAccountAddress: string;
-      editionAddress: string;
-      editionMetadataAddress: string;
-      signature: string;
-      confirmationSlot: number | null;
-      blockTime: Date | null;
-      serialNumber: number;
-      feeInLamports: number;
-    }> = [];
-    let mintFailure: unknown = null;
-
-    try {
-      const reservedCopies = await this.prisma.$transaction(async (tx) => {
-        const currentPayload =
-          payment.providerPayload &&
-          typeof payment.providerPayload === 'object' &&
-          !Array.isArray(payment.providerPayload)
-            ? (payment.providerPayload as Record<string, unknown>)
-            : {};
-        const lock = await tx.payment.updateMany({
-          where: {
-            id: payment.id,
-            status: PaymentStatus.PENDING,
-            OR: [
-              {
-                providerPayload: {
-                  equals: Prisma.AnyNull,
-                },
-              },
-              {
-                providerPayload: {
-                  path: ['stage'],
-                  equals: 'reserved',
-                },
-              },
-            ],
-          },
-          data: {
-            providerPayload: {
-              ...currentPayload,
-              stage: 'processing',
-              processingStartedAt: new Date().toISOString(),
-            },
-          },
-        });
-
-        if (lock.count !== 1) {
-          throw new BadRequestException(
-            'This payment is already being processed. Refresh purchase history.',
-          );
-        }
-
-        const buyerWallet = await tx.wallet.upsert({
-          where: {
-            userId,
-          },
-          update: {},
-          create: {
-            userId,
-          },
-        });
-
-        const requiredAmount =
-          payment.amountInUsdcMinor + estimatedGasFeeInUsdcMinor;
-        if (buyerWallet.availableBalanceInUsdcMinor < requiredAmount) {
-          throw new BadRequestException({
-            code: 'INSUFFICIENT_BALANCE',
-            message:
-              'Insufficient wallet balance for purchase + estimated sponsored gas. Top up and retry.',
-            requiredAmountInUsdcMinor: requiredAmount,
-            availableAmountInUsdcMinor: buyerWallet.availableBalanceInUsdcMinor,
-          });
-        }
-
-        await this.ledgerService.postEntry(
-          {
-            userId,
-            idempotencyKey: `purchase:hold:${payment.id}`,
-            type: LedgerEntryType.PURCHASE_HOLD,
-            amountInUsdcMinor: -payment.amountInUsdcMinor,
-            availableDeltaInUsdcMinor: -payment.amountInUsdcMinor,
-            pendingDeltaInUsdcMinor: payment.amountInUsdcMinor,
-            description: `Funds held for chapter purchase ${payment.reference}`,
-            reference: payment.reference,
-            mirrorWalletTransactionType: WalletTransactionType.PURCHASE,
-          },
-          tx,
-        );
-
-        const reserved: Array<{
-          itemId: string;
-          chapterEditionId: string;
-          serialNumber: number;
-        }> = [];
-
-        for (const item of payment.order.items) {
-          if (!item.chapterEdition) {
-            throw new BadRequestException(
-              'Order item is missing chapter edition metadata.',
-            );
-          }
-
-          const claimed = await tx.$queryRaw<Array<{ mintedCopies: number }>>`
-            UPDATE "ChapterEdition"
-            SET "mintedCopies" = "mintedCopies" + 1
-            WHERE "id" = ${item.chapterEdition.id}
-              AND "mintedCopies" < "maxCopies"
-            RETURNING "mintedCopies";
-          `;
-
-          if (claimed.length === 0) {
-            throw new BadRequestException(
-              `Chapter ${item.chapter?.chapterNumber ?? '?'} is sold out.`,
-            );
-          }
-
-          reserved.push({
-            itemId: item.id,
-            chapterEditionId: item.chapterEdition.id,
-            serialNumber: claimed[0].mintedCopies,
-          });
-        }
-
-        return reserved;
-      });
-
-      const reservedByItemId = new Map(
-        reservedCopies.map((entry) => [entry.itemId, entry]),
-      );
-
-      const sellerAddresses = Array.from(
-        new Set(
-          payment.order.items
-            .map((item) => item.chapterEdition?.sellerWalletAddress)
-            .filter((address): address is string => Boolean(address)),
-        ),
-      );
-      const sellerWallets = sellerAddresses.length
-        ? await this.prisma.userChainWallet.findMany({
-            where: {
-              address: {
-                in: sellerAddresses,
-              },
-              isActive: true,
-            },
-          })
-        : [];
-      const sellerWalletByAddress = new Map(
-        sellerWallets.map((wallet) => [wallet.address, wallet]),
-      );
-
-      for (const item of payment.order.items) {
-        try {
-          if (!item.chapter || !item.chapterEdition) {
-            throw new BadRequestException(
-              'Order item is missing chapter metadata.',
-            );
-          }
-
-          const reservedCopy = reservedByItemId.get(item.id);
-          if (!reservedCopy) {
-            throw new BadRequestException(
-              `Reserved chapter copy not found for Chapter ${item.chapter.chapterNumber}.`,
-            );
-          }
-
-          const sellerWallet = sellerWalletByAddress.get(
-            item.chapterEdition.sellerWalletAddress,
-          );
-          if (!sellerWallet?.encryptedPrivateKey) {
-            throw new BadRequestException(
-              'Paid chapter minting requires a custodial seller wallet.',
-            );
-          }
-
-          const mintedAsset = await this.solanaService.mintChapterAsset({
-            masterMintAddress: item.chapterEdition.masterMintAddress,
-            destinationWalletAddress: ownershipWallet.address,
-            editionNumber: reservedCopy.serialNumber,
-            collectionMintAddress: item.chapterEdition.collectionMintAddress,
-            masterTokenAccountOwnerEncryptedPrivateKey:
-              sellerWallet.encryptedPrivateKey,
-          });
-
-          mintedAssets.push({
-            itemId: item.id,
-            chapterEditionId: item.chapterEdition.id,
-            chapterNumber: item.chapter.chapterNumber,
-            ...mintedAsset,
-            serialNumber: reservedCopy.serialNumber,
-          });
-        } catch (error) {
-          mintFailure = error;
-          break;
-        }
-      }
-
-      const totalGasLamports = mintedAssets.reduce(
-        (sum, asset) => sum + asset.feeInLamports,
-        0,
-      );
-      const gasQuote =
-        await this.priceQuoteService.lamportsToUsdcMinorWithLockedQuote(
-          totalGasLamports,
-        );
-
-      const mintedByItemId = new Set(mintedAssets.map((asset) => asset.itemId));
-      const mintedItems = payment.order.items.filter((item) =>
-        mintedByItemId.has(item.id),
-      );
-      const unmintedItems = payment.order.items.filter(
-        (item) => !mintedByItemId.has(item.id),
-      );
-      const mintedAmountInUsdcMinor = mintedItems.reduce(
-        (sum, item) => sum + item.amountInUsdcMinor,
-        0,
-      );
-      const releasedAmountInUsdcMinor =
-        payment.amountInUsdcMinor - mintedAmountInUsdcMinor;
-      const isPartial = mintFailure !== null && mintedItems.length > 0;
-      const isTotalFailure = mintedItems.length === 0;
-      const failedChapterTitles = unmintedItems
-        .map((item) =>
-          item.chapter
-            ? `Chapter ${item.chapter.chapterNumber}: ${item.chapter.title}`
-            : null,
-        )
-        .filter((item): item is string => Boolean(item));
-
-      await this.prisma.$transaction(async (tx) => {
-        await tx.payment.update({
-          where: { id: payment.id },
-          data: {
-            status: isTotalFailure
-              ? PaymentStatus.FAILED
-              : PaymentStatus.SUCCEEDED,
-            paidAt: isTotalFailure ? null : new Date(),
-            payerWalletAddress: ownershipWallet.address,
-            recipientWalletAddress: payment.order.recipientWalletAddress,
-            chainTxSignature: mintedAssets[0]?.signature,
-            confirmationSlot: mintedAssets[0]?.confirmationSlot ?? undefined,
-            providerPayload: {
-              stage: isTotalFailure ? 'failed' : 'completed',
-              network: this.solanaService.getNetwork(),
-              payerMode: ownershipWallet.custodyType,
-              settlementMode: 'ledger-first',
-              totalGasFeeInUsdcMinor: gasQuote.feeInUsdcMinor,
-              totalGasLamports,
-              solUsdPriceLocked: gasQuote.solUsdPrice,
-              partialFulfillment: isPartial,
-              mintedChapters: mintedAssets.map((asset) => asset.chapterNumber),
-              failedChapters: unmintedItems
-                .map((item) => item.chapter?.chapterNumber)
-                .filter((chapterNumber): chapterNumber is number =>
-                  Boolean(chapterNumber),
-                ),
-              failureReason:
-                mintFailure instanceof Error ? mintFailure.message : undefined,
-            },
-          },
-        });
-
-        await tx.order.update({
-          where: { id: payment.orderId },
-          data: {
-            status: isTotalFailure
-              ? OrderStatus.CANCELLED
-              : OrderStatus.COMPLETED,
-            payerWalletAddress: ownershipWallet.address,
-            recipientWalletAddress: payment.order.recipientWalletAddress,
-          },
-        });
-
-        if (mintedAmountInUsdcMinor > 0) {
-          await this.ledgerService.postEntry(
-            {
-              userId,
-              idempotencyKey: `purchase:debit:${payment.id}`,
-              type: LedgerEntryType.PURCHASE_DEBIT,
-              amountInUsdcMinor: -mintedAmountInUsdcMinor,
-              availableDeltaInUsdcMinor: 0,
-              pendingDeltaInUsdcMinor: -mintedAmountInUsdcMinor,
-              description: `Chapter purchase debited ${payment.reference}`,
-              reference: payment.reference,
-              mirrorWalletTransactionType: WalletTransactionType.PURCHASE,
-            },
-            tx,
-          );
-        }
-
-        if (releasedAmountInUsdcMinor > 0) {
-          await this.ledgerService.postEntry(
-            {
-              userId,
-              idempotencyKey: `purchase:release:${payment.id}`,
-              type: LedgerEntryType.PURCHASE_RELEASE,
-              amountInUsdcMinor: releasedAmountInUsdcMinor,
-              availableDeltaInUsdcMinor: releasedAmountInUsdcMinor,
-              pendingDeltaInUsdcMinor: -releasedAmountInUsdcMinor,
-              description: `Purchase hold released ${payment.reference}`,
-              reference: payment.reference,
-              mirrorWalletTransactionType: WalletTransactionType.ADJUSTMENT,
-            },
-            tx,
-          );
-        }
-
-        if (mintedAmountInUsdcMinor > 0) {
-          await this.ledgerService.postEntry(
-            {
-              userId,
-              idempotencyKey: `gas:purchase:${payment.id}`,
-              type: LedgerEntryType.GAS_FEE_DEBIT,
-              amountInUsdcMinor: -gasQuote.feeInUsdcMinor,
-              availableDeltaInUsdcMinor: -gasQuote.feeInUsdcMinor,
-              description: `Sponsored gas fee for ${payment.reference}`,
-              reference: payment.reference,
-              metadataJson: {
-                totalGasLamports,
-                solUsdPriceLocked: gasQuote.solUsdPrice,
-              },
-              mirrorWalletTransactionType: WalletTransactionType.GAS_FEE,
-            },
-            tx,
-          );
-        }
-
-        for (const item of mintedItems) {
-          if (!item.chapter || !item.chapterEdition) {
-            throw new BadRequestException(
-              'Order item is missing chapter metadata.',
-            );
-          }
-
-          const mintedAsset = mintedAssets.find(
-            (asset) => asset.itemId === item.id,
-          );
-
-          if (!mintedAsset) {
-            throw new BadRequestException('Missing confirmed mint result.');
-          }
-
-          await tx.chapterEdition.update({
-            where: {
-              id: item.chapterEdition.id,
-            },
-            data: {
-              mintedCopies: {
-                increment: 1,
-              },
-            },
-          });
-
-          await tx.chapterToken.create({
-            data: {
-              chapterId: item.chapter.id,
-              editionId: item.chapterEdition.id,
-              ownerUserId: userId,
-              ownerWalletId: ownershipWallet.id,
-              ownerWalletAddress: ownershipWallet.address,
-              mintAddress: mintedAsset.mintAddress,
-              tokenAccountAddress: mintedAsset.tokenAccountAddress,
-              editionAddress: mintedAsset.editionAddress,
-              editionMetadataAddress: mintedAsset.editionMetadataAddress,
-              serialNumber: mintedAsset.serialNumber,
-              mintTxSignature: mintedAsset.signature,
-              currentOwnershipVerifiedAt: new Date(),
-            },
-          });
-
-          await tx.onchainTransaction.create({
-            data: {
-              signature: mintedAsset.signature,
-              network: this.solanaService.getNetwork(),
-              txType: OnchainTransactionType.PRINT_EDITION_MINT,
-              status: OnchainTransactionStatus.CONFIRMED,
-              slot: mintedAsset.confirmationSlot ?? undefined,
-              blockTime: mintedAsset.blockTime ?? undefined,
-              confirmationCommitment:
-                this.solanaService.getConfirmationCommitment(),
-              metadataJson: {
-                mintAddress: mintedAsset.mintAddress,
-                tokenAccountAddress: mintedAsset.tokenAccountAddress,
-                editionAddress: mintedAsset.editionAddress,
-                editionMetadataAddress: mintedAsset.editionMetadataAddress,
-                serialNumber: mintedAsset.serialNumber,
-                collectionMintAddress:
-                  item.chapterEdition.collectionMintAddress,
-                feeInLamports: mintedAsset.feeInLamports,
-              },
-              userId,
-              bookId: item.offer.bookId,
-              chapterId: item.chapter.id,
-              orderId: payment.orderId,
-              paymentId: payment.id,
-            },
-          });
-
-          await this.ledgerService.postEntry(
-            {
-              userId: item.offer.book.authorId,
-              idempotencyKey: `sale:${payment.id}:${item.id}`,
-              type: LedgerEntryType.SALE_CREDIT,
-              amountInUsdcMinor: item.amountInUsdcMinor,
-              availableDeltaInUsdcMinor: item.amountInUsdcMinor,
-              description: `Chapter sale credit for ${item.offer.title}`,
-              reference: payment.reference,
-              mirrorWalletTransactionType: WalletTransactionType.SALE,
-            },
-            tx,
-          );
-
-          await tx.libraryItem.upsert({
-            where: {
-              userId_bookId: {
-                userId,
-                bookId: item.offer.bookId,
-              },
-            },
-            update: {},
-            create: {
-              userId,
-              bookId: item.offer.bookId,
-            },
-          });
-
-          await tx.analyticsSnapshot.upsert({
-            where: {
-              bookId_date: {
-                bookId: item.offer.bookId,
-                date: new Date(new Date().toDateString()),
-              },
-            },
-            update: {
-              purchases: {
-                increment: 1,
-              },
-              revenueInUsdcMinor: {
-                increment: item.amountInUsdcMinor,
-              },
-            },
-            create: {
-              bookId: item.offer.bookId,
-              date: new Date(new Date().toDateString()),
-              purchases: 1,
-              revenueInUsdcMinor: item.amountInUsdcMinor,
-            },
-          });
-        }
-
-        for (const item of unmintedItems) {
-          if (!item.chapterEdition) {
-            continue;
-          }
-
-          await tx.chapterEdition.update({
-            where: { id: item.chapterEdition.id },
-            data: {
-              mintedCopies: {
-                decrement: 1,
-              },
-            },
-          });
-        }
-
-        if (mintedItems.length > 0) {
-          await tx.purchaseReservation.updateMany({
-            where: {
-              orderId: payment.orderId,
-              chapterEditionId: {
-                in: mintedItems
-                  .map((item) => item.chapterEdition?.id)
-                  .filter((id): id is string => Boolean(id)),
-              },
-              releasedAt: null,
-            },
-            data: {
-              fulfilledAt: new Date(),
-              releasedAt: new Date(),
-            },
-          });
-        }
-
-        if (unmintedItems.length > 0) {
-          await tx.purchaseReservation.updateMany({
-            where: {
-              orderId: payment.orderId,
-              chapterEditionId: {
-                in: unmintedItems
-                  .map((item) => item.chapterEdition?.id)
-                  .filter((id): id is string => Boolean(id)),
-              },
-              releasedAt: null,
-            },
-            data: {
-              releasedAt: new Date(),
-            },
-          });
-        }
-      });
-
-      if (mintedItems.length > 0) {
-        const network = this.solanaService.getNetwork();
-        const explorerCluster =
-          network && network !== 'mainnet-beta'
-            ? `?cluster=${encodeURIComponent(network)}`
-            : '';
-        const mintedAssetLinks = mintedItems
-          .map((item) => {
-            const mintedAsset = mintedAssets.find(
-              (asset) => asset.itemId === item.id,
-            );
-            const chapterNumber = item.chapter?.chapterNumber;
-            if (!mintedAsset?.mintAddress) {
-              return null;
-            }
-
-            const label = chapterNumber
-              ? `View Chapter ${chapterNumber} asset`
-              : 'View chapter asset';
-
-            return {
-              label,
-              url: `https://explorer.solana.com/address/${mintedAsset.mintAddress}${explorerCluster}`,
-            };
-          })
-          .filter(
-            (
-              item,
-            ): item is {
-              label: string;
-              url: string;
-            } => Boolean(item),
-          );
-
-        await this.emailsService.sendPurchaseSuccessEmail({
-          to: payment.order.user.email,
-          displayName: payment.order.user.displayName,
-          bookTitle: payment.order.items[0]?.offer.book.title ?? 'your book',
-          chapterTitles: mintedItems
-            .map((item) =>
-              item.chapter
-                ? `Chapter ${item.chapter.chapterNumber}: ${item.chapter.title}`
-                : null,
-            )
-            .filter((item): item is string => Boolean(item)),
-          failedChapterTitles: failedChapterTitles.length
-            ? failedChapterTitles
-            : undefined,
-          amountFormatted: formatCurrency(mintedAmountInUsdcMinor, 'USDC'),
-          reference,
-          assetLinks: mintedAssetLinks.length ? mintedAssetLinks : undefined,
-        });
-      }
-
-      if (isTotalFailure) {
-        await this.emailsService.sendPurchaseFailedEmail({
-          to: payment.order.user.email,
-          displayName: payment.order.user.displayName,
-          bookTitle: payment.order.items[0]?.offer.book.title ?? 'your book',
-          chapterTitles: payment.order.items
-            .map((item) =>
-              item.chapter
-                ? `Chapter ${item.chapter.chapterNumber}: ${item.chapter.title}`
-                : null,
-            )
-            .filter((item): item is string => Boolean(item)),
-          amountFormatted: formatCurrency(payment.amountInUsdcMinor, 'USDC'),
-          reference,
-          failureReason:
-            mintFailure instanceof Error ? mintFailure.message : undefined,
-        });
-        throw new InternalServerErrorException(
-          'Minting failed before purchase completion. Funds were released back to your wallet.',
-        );
-      }
-
-      const purchasedChapterNumbers = mintedItems
-        .map((item) => item.chapter?.chapterNumber)
-        .filter((chapterNumber): chapterNumber is number =>
-          Boolean(chapterNumber),
-        )
-        .sort((left, right) => left - right);
-
-      return {
-        reference,
-        status: 'SUCCEEDED',
-        network: this.solanaService.getNetwork(),
-        chainTxSignature: mintedAssets[0]?.signature ?? 'N/A',
-        formattedAmount: formatCurrency(mintedAmountInUsdcMinor, 'USDC'),
-        firstPurchasedChapterNumber:
-          purchasedChapterNumbers[0] ?? firstPurchasedChapterNumber,
-        gasFeeInUsdcMinor: gasQuote.feeInUsdcMinor,
-        formattedGasFee: formatCurrency(gasQuote.feeInUsdcMinor, 'USDC'),
-        partialFulfillment: isPartial,
-        failedChapterNumbers: isPartial
-          ? unmintedItems
-              .map((item) => item.chapter?.chapterNumber)
-              .filter((chapterNumber): chapterNumber is number =>
-                Boolean(chapterNumber),
-              )
-              .sort((left, right) => left - right)
-          : [],
-      };
-    } catch (error) {
-      // Best-effort: if we placed a hold but failed before settling the purchase,
-      // release held funds and mark the payment/order as failed.
-      // Note: If minting succeeded on-chain but settlement failed, we do NOT
-      // auto-release here; those cases should be reconciled.
-      if (mintedAssets.length === 0) {
-        const message =
-          error instanceof Error ? error.message : 'Unknown error';
-        await this.prisma.$transaction(async (tx) => {
-          const hold = await tx.ledgerJournal.findUnique({
-            where: { idempotencyKey: `purchase:hold:${payment.id}` },
-          });
-
-          if (hold) {
-            await this.ledgerService.postEntry(
-              {
-                userId,
-                idempotencyKey: `purchase:release:${payment.id}`,
-                type: LedgerEntryType.PURCHASE_RELEASE,
-                amountInUsdcMinor: payment.amountInUsdcMinor,
-                availableDeltaInUsdcMinor: payment.amountInUsdcMinor,
-                pendingDeltaInUsdcMinor: -payment.amountInUsdcMinor,
-                description: `Purchase hold released ${payment.reference}`,
-                reference: payment.reference,
-                mirrorWalletTransactionType: WalletTransactionType.ADJUSTMENT,
-                metadataJson: { failureReason: message },
-              },
-              tx,
-            );
-          }
-
-          const currentPayload =
-            payment.providerPayload &&
-            typeof payment.providerPayload === 'object' &&
-            !Array.isArray(payment.providerPayload)
-              ? (payment.providerPayload as Record<string, unknown>)
-              : {};
-          await tx.payment.update({
-            where: { id: payment.id },
-            data: {
-              status: PaymentStatus.FAILED,
-              paidAt: null,
-              providerPayload: {
-                ...currentPayload,
-                stage: 'failed',
-                network: this.solanaService.getNetwork(),
-                settlementMode: 'ledger-first',
-                failureReason: message,
-              },
-            },
-          });
-
-          await tx.order.update({
-            where: { id: payment.orderId },
-            data: { status: OrderStatus.CANCELLED },
-          });
-
-          await tx.purchaseReservation.updateMany({
-            where: { orderId: payment.orderId, releasedAt: null },
-            data: { releasedAt: new Date() },
-          });
-        });
-      }
-
-      throw error;
+    if (directResult) {
+      return directResult;
     }
+
+    throw new BadRequestException(
+      'Non-custodial purchase completion requires direct transfer signing.',
+    );
+
+    throw new BadRequestException(
+      'Non-custodial purchase completion requires direct transfer signing.',
+    );
   }
 
   async getPurchaseHistory(userId: string) {
