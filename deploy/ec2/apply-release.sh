@@ -16,6 +16,24 @@ fi
 
 cd "${RELEASE_DIR}"
 
+load_node_toolchain() {
+  export NVM_DIR="${NVM_DIR:-$HOME/.nvm}"
+
+  for rc in "$HOME/.profile" "$HOME/.bashrc" "$HOME/.bash_profile"; do
+    if [[ -f "${rc}" ]]; then
+      # shellcheck disable=SC1090
+      source "${rc}"
+    fi
+  done
+
+  if [[ -s "${NVM_DIR}/nvm.sh" ]]; then
+    # shellcheck disable=SC1090
+    source "${NVM_DIR}/nvm.sh"
+  fi
+}
+
+load_node_toolchain
+
 pnpm_cmd() {
   if command -v pnpm >/dev/null 2>&1; then
     pnpm "$@"
@@ -29,7 +47,13 @@ pnpm_cmd() {
     return
   fi
 
-  npx --yes pnpm@10.17.1 "$@"
+  if command -v npm >/dev/null 2>&1; then
+    npm exec --yes pnpm@10.17.1 -- "$@"
+    return
+  fi
+
+  echo "pnpm, corepack, and npm are not available on this host" >&2
+  exit 1
 }
 
 echo "==> Syncing release bundle into ${APP_DIR}"

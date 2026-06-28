@@ -11,6 +11,24 @@ fi
 
 cd "${APP_DIR}"
 
+load_node_toolchain() {
+  export NVM_DIR="${NVM_DIR:-$HOME/.nvm}"
+
+  for rc in "$HOME/.profile" "$HOME/.bashrc" "$HOME/.bash_profile"; do
+    if [[ -f "${rc}" ]]; then
+      # shellcheck disable=SC1090
+      source "${rc}"
+    fi
+  done
+
+  if [[ -s "${NVM_DIR}/nvm.sh" ]]; then
+    # shellcheck disable=SC1090
+    source "${NVM_DIR}/nvm.sh"
+  fi
+}
+
+load_node_toolchain
+
 if [[ -n "${RELEASE_INPUT}" && -d "${RELEASE_INPUT}" ]]; then
   bash "${APP_DIR}/deploy/ec2/apply-release.sh" "${RELEASE_INPUT}"
   exit 0
