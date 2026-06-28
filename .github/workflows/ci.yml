@@ -102,8 +102,8 @@ jobs:
           username: ${{ secrets.EC2_USER }}
           key: ${{ secrets.EC2_SSH_KEY }}
           port: ${{ secrets.EC2_PORT || 22 }}
-          source: release/release.tgz
-          target: /tmp/lesenpad-release-${{ github.sha }}/release.tgz
+          source: release/*
+          target: /tmp/lesenpad-release-${{ github.sha }}
 
       - name: Apply release on EC2
         uses: appleboy/ssh-action@v1.0.3
@@ -115,8 +115,13 @@ jobs:
           script: |
             set -euo pipefail
             RELEASE_ROOT="/tmp/lesenpad-release-${{ github.sha }}"
-            RELEASE_TGZ="${RELEASE_ROOT}/release.tgz"
+            RELEASE_TGZ="$(find "${RELEASE_ROOT}" -maxdepth 2 -name release.tgz -type f | head -n 1)"
             RELEASE_DIR="${RELEASE_ROOT}/bundle"
+            if [[ -z "${RELEASE_TGZ}" ]]; then
+              echo "release.tgz not found under ${RELEASE_ROOT}" >&2
+              find "${RELEASE_ROOT}" -maxdepth 3 -print >&2 || true
+              exit 1
+            fi
             mkdir -p "${RELEASE_DIR}"
             tar -xzf "${RELEASE_TGZ}" -C "${RELEASE_DIR}"
             bash "${RELEASE_DIR}/deploy/ec2/apply-release.sh" "${RELEASE_DIR}"
