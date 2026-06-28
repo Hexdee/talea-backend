@@ -1,19 +1,5 @@
-import { dirname, join } from 'node:path';
 import sanitizeHtml from 'sanitize-html';
 import { SourceFormat } from '@prisma/client';
-
-const markedBundlePath = join(
-  dirname(require.resolve('marked/package.json')),
-  'lib/marked.umd.js',
-);
-// marked is ESM-only at the package entrypoint; this loads the UMD bundle for Jest/CJS compatibility.
-// eslint-disable-next-line @typescript-eslint/no-require-imports
-const { marked } = require(markedBundlePath) as typeof import('marked');
-
-marked.setOptions({
-  gfm: true,
-  breaks: true,
-});
 
 function escapeHtml(value: string) {
   return value
@@ -24,6 +10,19 @@ function escapeHtml(value: string) {
     .replace(/'/g, '&#39;');
 }
 
+function renderInlineMarkup(input: string) {
+  const escaped = escapeHtml(input);
+  return escaped
+    .replace(
+      /\[([^\]]+)\]\(((?:https?:\/\/|mailto:)[^)]+)\)/g,
+      (_match, label: string, href: string) =>
+        `<a href="${escapeHtml(href)}">${label}</a>`,
+    )
+    .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+    .replace(/\*([^*]+)\*/g, '<em>$1</em>')
+    .replace(/`([^`]+)`/g, '<code>$1</code>');
+}
+
 function renderPlainText(content: string) {
   return escapeHtml(content)
     .split(/\n{2,}/)
@@ -32,7 +31,25 @@ function renderPlainText(content: string) {
 }
 
 function renderMarkdown(markdown: string) {
-  return marked.parse(markdown) as string;
+  return markdown
+    .split(/\n{2,}/)
+    .map((block) => {
+      const trimmed = block.trim();
+
+      if (!trimmed) {
+        return '';
+      }
+
+      const headingMatch = trimmed.match(/^(#{1,3})\s+(.+)$/);
+      if (headingMatch) {
+        const level = headingMatch[1].length;
+        const content = renderInlineMarkup(headingMatch[2].trim());
+        return `<h${level}>${content}</h${level}>`;
+      }
+
+      return `<p>${renderInlineMarkup(trimmed).replace(/\n/g, '<br />')}</p>`;
+    })
+    .join('');
 }
 
 export function renderPublishedHtml(format: SourceFormat, content: string) {
