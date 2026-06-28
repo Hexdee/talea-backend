@@ -16,10 +16,21 @@ fi
 
 cd "${RELEASE_DIR}"
 
-if ! command -v pnpm >/dev/null 2>&1; then
-  corepack enable
-  corepack prepare pnpm@10.17.1 --activate
-fi
+pnpm_cmd() {
+  if command -v pnpm >/dev/null 2>&1; then
+    pnpm "$@"
+    return
+  fi
+
+  if command -v corepack >/dev/null 2>&1; then
+    corepack enable
+    corepack prepare pnpm@10.17.1 --activate
+    pnpm "$@"
+    return
+  fi
+
+  npx --yes pnpm@10.17.1 "$@"
+}
 
 echo "==> Syncing release bundle into ${APP_DIR}"
 mkdir -p "${APP_DIR}"
@@ -38,17 +49,16 @@ cp prisma.config.ts "${APP_DIR}/"
 cd "${APP_DIR}"
 
 echo "==> Installing dependencies"
-pnpm install --frozen-lockfile --prod=false
+pnpm_cmd install --frozen-lockfile --prod=false
 
 echo "==> Generating Prisma client"
-pnpm prisma generate
+pnpm_cmd prisma generate
 
 echo "==> Running migrations"
-pnpm prisma migrate deploy
+pnpm_cmd prisma migrate deploy
 
 echo "==> Reloading PM2 processes"
 pm2 startOrReload ecosystem.config.js --env production --update-env
 pm2 save
 pm2 status lezenpad-backend
 pm2 status lesenpad-reconciliation-worker
-
