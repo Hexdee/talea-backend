@@ -1,6 +1,14 @@
+import { dirname, join } from 'node:path';
 import sanitizeHtml from 'sanitize-html';
 import { SourceFormat } from '@prisma/client';
-import { marked } from 'marked';
+
+const markedBundlePath = join(
+  dirname(require.resolve('marked/package.json')),
+  'lib/marked.umd.js',
+);
+// marked is ESM-only at the package entrypoint; this loads the UMD bundle for Jest/CJS compatibility.
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+const { marked } = require(markedBundlePath) as typeof import('marked');
 
 marked.setOptions({
   gfm: true,
