@@ -69,3 +69,54 @@ jobs:
 
       - name: Build
         run: pnpm build
+
+      - name: Create release bundle
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: tar -czf release.tgz dist package.json pnpm-lock.yaml prisma prisma.config.ts ecosystem.config.js deploy
+
+      - name: Upload release bundle
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-release-${{ github.sha }}
+          path: release.tgz
+          if-no-files-found: error
+          retention-days: 7
+
+  deploy:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: verify
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download release bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: backend-release-${{ github.sha }}
+          path: release
+
+      - name: Copy release bundle to EC2
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          port: ${{ secrets.EC2_PORT || 22 }}
+          source: release/release.tgz
+          target: /tmp/lesenpad-release-${{ github.sha }}
+
+      - name: Apply release on EC2
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          port: ${{ secrets.EC2_PORT || 22 }}
+          script: |
+            set -euo pipefail
+            RELEASE_ROOT="/tmp/lesenpad-release-${{ github.sha }}"
+            RELEASE_DIR="${RELEASE_ROOT}/bundle"
+            mkdir -p "${RELEASE_DIR}"
+            tar -xzf "${RELEASE_ROOT}/release.tgz" -C "${RELEASE_DIR}"
+            bash "${RELEASE_DIR}/deploy/ec2/apply-release.sh" "${RELEASE_DIR}"
+            rm -rf "${RELEASE_ROOT}"

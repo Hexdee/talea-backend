@@ -5,6 +5,12 @@ APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${APP_DIR}"
 
 BRANCH="${1:-main}"
+RELEASE_INPUT="${2:-${RELEASE_DIR:-}}"
+
+if [[ -n "${RELEASE_INPUT}" && -d "${RELEASE_INPUT}" ]]; then
+  bash "${APP_DIR}/deploy/ec2/apply-release.sh" "${RELEASE_INPUT}"
+  exit 0
+fi
 
 echo "==> Redeploying Lesenpad backend on branch: ${BRANCH}"
 

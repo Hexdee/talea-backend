@@ -4,6 +4,13 @@ set -euo pipefail
 APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${APP_DIR}"
 
+RELEASE_INPUT="${1:-${RELEASE_DIR:-}}"
+
+if [[ -n "${RELEASE_INPUT}" && -d "${RELEASE_INPUT}" ]]; then
+  bash "${APP_DIR}/deploy/ec2/apply-release.sh" "${RELEASE_INPUT}"
+  exit 0
+fi
+
 echo "==> Deploying Lesenpad backend from ${APP_DIR}"
 
 if ! command -v pnpm >/dev/null 2>&1; then
