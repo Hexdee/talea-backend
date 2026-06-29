@@ -44,6 +44,13 @@ export const envSchema = z
     SESSION_TTL_DAYS: integerString.default('14'),
     CHAIN_MASTER_KEY: requiredChainSecret('test-chain-master-key'),
     WALLET_PROVIDER: z.enum(['solana', 'circle']).default('solana'),
+    CROSSMINT_ENABLED: z.enum(['true', 'false']).default('false'),
+    CROSSMINT_CLIENT_API_KEY: z.string().optional(),
+    CROSSMINT_JWT_ISSUER: z.string().default('lesenpad-backend'),
+    CROSSMINT_JWT_AUDIENCE: z.string().default('crossmint'),
+    CROSSMINT_JWT_KEY_ID: z.string().default('lesenpad-crossmint'),
+    CROSSMINT_JWT_PRIVATE_KEY: z.string().optional(),
+    CROSSMINT_JWT_PRIVATE_KEY_FILE: z.string().optional(),
     SOLANA_NETWORK: z.string().default('mainnet-beta'),
     SOLANA_RPC_URL: z.string().default(DEFAULT_MAINNET_SOLANA_RPC_URL),
     SOLANA_USDC_MINT_ADDRESS: requiredChainSecret(MAINNET_USDC_MINT_ADDRESS),
@@ -164,6 +171,29 @@ export const envSchema = z
           path: ['HASHICORP_VAULT_SECRET_PATH'],
           message:
             'HASHICORP_VAULT_SECRET_PATH is required when using vault secrets.',
+        });
+      }
+    }
+
+    if (config.CROSSMINT_ENABLED === 'true') {
+      if (!config.CROSSMINT_CLIENT_API_KEY?.trim()) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['CROSSMINT_CLIENT_API_KEY'],
+          message:
+            'CROSSMINT_CLIENT_API_KEY is required when CROSSMINT_ENABLED=true.',
+        });
+      }
+
+      if (
+        !config.CROSSMINT_JWT_PRIVATE_KEY?.trim() &&
+        !config.CROSSMINT_JWT_PRIVATE_KEY_FILE?.trim()
+      ) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['CROSSMINT_JWT_PRIVATE_KEY'],
+          message:
+            'Set CROSSMINT_JWT_PRIVATE_KEY or CROSSMINT_JWT_PRIVATE_KEY_FILE when CROSSMINT_ENABLED=true.',
         });
       }
     }

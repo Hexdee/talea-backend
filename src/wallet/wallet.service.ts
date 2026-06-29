@@ -26,6 +26,7 @@ import {
   CreatePayoutAccountDto,
   CreatePayoutRequestDto,
   LinkExternalWalletDto,
+  RegisterEmbeddedWalletDto,
   VerifyDepositDto,
 } from './dto/wallet.dto';
 
@@ -405,6 +406,7 @@ export class WalletService {
         address: item.address,
         label: item.label,
         custodyType: item.custodyType,
+        providerWalletId: item.providerWalletId,
         usdcTokenAccountAddress: item.usdcTokenAccountAddress,
         usdcBalanceInUsdcMinor:
           'currentUsdcBalanceInUsdcMinor' in item
@@ -459,6 +461,62 @@ export class WalletService {
         address: dto.address,
         label: dto.label,
         custodyType: 'EXTERNAL',
+        isDefault: dto.makeDefault ?? false,
+      },
+    });
+  }
+
+  async linkEmbeddedWallet(userId: string, dto: RegisterEmbeddedWalletDto) {
+    if (!dto.address?.trim()) {
+      throw new BadRequestException(
+        'Enter a valid Crossmint embedded wallet address.',
+      );
+    }
+
+    if (!dto.providerWalletId?.trim()) {
+      throw new BadRequestException('Enter a valid Crossmint wallet identity.');
+    }
+
+    const existing = await this.prisma.userChainWallet.findUnique({
+      where: {
+        address: dto.address,
+      },
+    });
+
+    if (existing && existing.userId !== userId) {
+      throw new BadRequestException(
+        'That embedded wallet is already linked to another account.',
+      );
+    }
+
+    if (dto.makeDefault) {
+      await this.prisma.userChainWallet.updateMany({
+        where: {
+          userId,
+        },
+        data: {
+          isDefault: false,
+        },
+      });
+    }
+
+    return this.prisma.userChainWallet.upsert({
+      where: {
+        address: dto.address,
+      },
+      update: {
+        label: dto.label,
+        providerWalletId: dto.providerWalletId,
+        custodyType: 'EMBEDDED',
+        isActive: true,
+        isDefault: dto.makeDefault ?? false,
+      },
+      create: {
+        userId,
+        address: dto.address,
+        label: dto.label,
+        providerWalletId: dto.providerWalletId,
+        custodyType: 'EMBEDDED',
         isDefault: dto.makeDefault ?? false,
       },
     });

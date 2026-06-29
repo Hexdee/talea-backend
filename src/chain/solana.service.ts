@@ -13,6 +13,8 @@ import {
   PublicKey,
   SendTransactionError,
   Transaction,
+  TransactionMessage,
+  VersionedTransaction,
   sendAndConfirmTransaction,
 } from '@solana/web3.js';
 import {
@@ -297,15 +299,18 @@ export class SolanaService {
       );
     }
 
-    transaction.partialSign(treasury);
+    const versionedMessage = new TransactionMessage({
+      payerKey: treasury.publicKey,
+      recentBlockhash: blockhash,
+      instructions: transaction.instructions,
+    }).compileToV0Message();
+    const versionedTransaction = new VersionedTransaction(versionedMessage);
+    versionedTransaction.sign([treasury]);
 
     return {
-      transactionBase64: transaction
-        .serialize({
-          requireAllSignatures: false,
-          verifySignatures: false,
-        })
-        .toString('base64'),
+      transactionBase64: Buffer.from(versionedTransaction.serialize()).toString(
+        'base64',
+      ),
       feePayerAddress: treasury.publicKey.toBase58(),
       sourceTokenAccountAddress: sourceTokenAccount.toBase58(),
       recipientTokenAccountAddresses: recipientAccounts.map((recipient) =>

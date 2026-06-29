@@ -18,11 +18,16 @@ import { SessionUserDto } from './dto/session-user.dto';
 import { SignupDto } from './dto/signup.dto';
 import { OptionalSessionAuthGuard } from './guards/optional-session-auth.guard';
 import { AuthService } from './auth.service';
+import { CrossmintAuthService } from './crossmint-auth.service';
+import { SessionAuthGuard } from './guards/session-auth.guard';
 
 @ApiTags('auth')
 @Controller('auth')
 export class AuthController {
-  constructor(private readonly authService: AuthService) {}
+  constructor(
+    private readonly authService: AuthService,
+    private readonly crossmintAuthService: CrossmintAuthService,
+  ) {}
 
   @Post('signup')
   @Version('1')
@@ -59,6 +64,19 @@ export class AuthController {
   })
   getSession(@CurrentUser() user: SessionUserDto | null) {
     return user;
+  }
+
+  @Get('crossmint/jwt')
+  @Version('1')
+  @UseGuards(SessionAuthGuard)
+  getCrossmintJwt(@CurrentUser() user: SessionUserDto) {
+    return this.crossmintAuthService.issueJwt(user);
+  }
+
+  @Get('crossmint/jwks')
+  @Version('1')
+  getCrossmintJwks() {
+    return this.crossmintAuthService.getPublicJwks();
   }
 
   @Get('google')

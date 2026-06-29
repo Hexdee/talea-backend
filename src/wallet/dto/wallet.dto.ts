@@ -24,6 +24,25 @@ export class LinkExternalWalletDto {
   makeDefault?: boolean;
 }
 
+export class RegisterEmbeddedWalletDto {
+  @ApiProperty()
+  @IsString()
+  address!: string;
+
+  @ApiProperty()
+  @IsString()
+  providerWalletId!: string;
+
+  @ApiProperty()
+  @IsString()
+  label!: string;
+
+  @ApiProperty({ required: false })
+  @IsOptional()
+  @IsBoolean()
+  makeDefault?: boolean;
+}
+
 export class SetDefaultWalletDto {
   @ApiProperty()
   @IsString()

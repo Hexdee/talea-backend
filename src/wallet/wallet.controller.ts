@@ -15,6 +15,7 @@ import {
   CreatePayoutAccountDto,
   CreatePayoutRequestDto,
   LinkExternalWalletDto,
+  RegisterEmbeddedWalletDto,
   SetDefaultWalletDto,
   VerifyDepositDto,
 } from './dto/wallet.dto';
@@ -39,6 +40,15 @@ export class WalletController {
     @Body() dto: LinkExternalWalletDto,
   ) {
     return this.walletService.linkExternalWallet(user.id, dto);
+  }
+
+  @Post('chain-wallets/embedded')
+  @Version('1')
+  linkEmbeddedWallet(
+    @CurrentUser() user: SessionUser,
+    @Body() dto: RegisterEmbeddedWalletDto,
+  ) {
+    return this.walletService.linkEmbeddedWallet(user.id, dto);
   }
 
   @Patch('chain-wallets/default')
