@@ -477,48 +477,67 @@ export class WalletService {
       throw new BadRequestException('Enter a valid Crossmint wallet identity.');
     }
 
-    const existing = await this.prisma.userChainWallet.findUnique({
-      where: {
-        address: dto.address,
-      },
-    });
-
-    if (existing && existing.userId !== userId) {
-      throw new BadRequestException(
-        'That embedded wallet is already linked to another account.',
-      );
-    }
-
-    if (dto.makeDefault) {
-      await this.prisma.userChainWallet.updateMany({
+    return this.prisma.$transaction(async (tx) => {
+      const existingByAddress = await tx.userChainWallet.findUnique({
         where: {
-          userId,
-        },
-        data: {
-          isDefault: false,
+          address: dto.address,
         },
       });
-    }
+      const existingByProviderWalletId = await tx.userChainWallet.findUnique({
+        where: {
+          providerWalletId: dto.providerWalletId,
+        },
+      });
+      const existing = existingByAddress ?? existingByProviderWalletId;
 
-    return this.prisma.userChainWallet.upsert({
-      where: {
-        address: dto.address,
-      },
-      update: {
-        label: dto.label,
-        providerWalletId: dto.providerWalletId,
-        custodyType: 'EMBEDDED',
-        isActive: true,
-        isDefault: dto.makeDefault ?? false,
-      },
-      create: {
-        userId,
-        address: dto.address,
-        label: dto.label,
-        providerWalletId: dto.providerWalletId,
-        custodyType: 'EMBEDDED',
-        isDefault: dto.makeDefault ?? false,
-      },
+      if (
+        (existingByAddress && existingByAddress.userId !== userId) ||
+        (existingByProviderWalletId &&
+          existingByProviderWalletId.userId !== userId)
+      ) {
+        throw new BadRequestException(
+          'That embedded wallet is already linked to another account.',
+        );
+      }
+
+      if (dto.makeDefault) {
+        await tx.userChainWallet.updateMany({
+          where: {
+            userId,
+          },
+          data: {
+            isDefault: false,
+          },
+        });
+      }
+
+      if (existing) {
+        return tx.userChainWallet.update({
+          where: {
+            id: existing.id,
+          },
+          data: {
+            address: dto.address,
+            label: dto.label,
+            providerWalletId: dto.providerWalletId,
+            custodyType: 'EMBEDDED',
+            isActive: true,
+            isDefault: dto.makeDefault ?? false,
+            userId,
+          },
+        });
+      }
+
+      return tx.userChainWallet.create({
+        data: {
+          userId,
+          address: dto.address,
+          label: dto.label,
+          providerWalletId: dto.providerWalletId,
+          custodyType: 'EMBEDDED',
+          isDefault: dto.makeDefault ?? false,
+        },
+      });
     });
   }
 
