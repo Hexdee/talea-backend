@@ -24,13 +24,14 @@ FROM base AS build
 RUN apt-get update -qq && \
     apt-get install --no-install-recommends -y build-essential node-gyp openssl pkg-config python-is-python3
 
-# Install node modules
-COPY package.json pnpm-lock.yaml ./
+# Install node modules and generate Prisma's runtime during dependency setup.
+COPY package.json pnpm-lock.yaml prisma.config.ts ./
+COPY prisma ./prisma
+COPY scripts/generate-prisma-client.mjs ./scripts/generate-prisma-client.mjs
 RUN pnpm install --frozen-lockfile --prod=false
 
-# Generate Prisma Client
-COPY prisma .
-RUN npx prisma generate
+# Fail the image build if the generated client cannot be loaded.
+RUN node -e "require('@prisma/client')"
 
 # Copy application code
 COPY . .
