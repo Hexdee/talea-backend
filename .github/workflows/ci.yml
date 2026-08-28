@@ -47,7 +47,10 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Generate Prisma client
-        run: pnpm exec prisma generate
+        run: pnpm run prisma:generate
+
+      - name: Verify generated Prisma client
+        run: node -e "require('@prisma/client')"
 
       - name: Apply migrations
         run: pnpm exec prisma migrate deploy
